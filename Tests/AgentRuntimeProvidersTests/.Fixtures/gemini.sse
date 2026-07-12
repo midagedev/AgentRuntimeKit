@@ -1,0 +1,3 @@
+data: {"responseId":"gemini_fixture","modelVersion":"gemini-fixture","candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"Hello "}]}}]}
+
+data: {"responseId":"gemini_fixture","modelVersion":"gemini-fixture","candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"planning","thought":true},{"functionCall":{"id":"call_fixture","name":"weather","args":{"city":"Seoul"}},"thoughtSignature":"signed-gemini-state"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":3,"thoughtsTokenCount":1,"cachedContentTokenCount":2}}

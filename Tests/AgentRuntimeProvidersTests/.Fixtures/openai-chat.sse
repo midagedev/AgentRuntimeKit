@@ -1,0 +1,9 @@
+data: {"id":"chat_fixture","model":"gpt-fixture","choices":[{"index":0,"delta":{"content":"Hi ","reasoning_content":"thinking "},"finish_reason":null}]}
+
+data: {"id":"chat_fixture","model":"gpt-fixture","choices":[{"index":0,"delta":{"content":"there","tool_calls":[{"index":0,"id":"call_fixture","type":"function","function":{"name":"wea","arguments":"{\"city\":"}}]},"finish_reason":null}]}
+
+data: {"id":"chat_fixture","model":"gpt-fixture","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"ther","arguments":"\"Seoul\"}"}}]},"finish_reason":"tool_calls"}]}
+
+data: {"id":"chat_fixture","model":"gpt-fixture","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":2}}}
+
+data: [DONE]

@@ -1,0 +1,8 @@
+: heartbeat
+id: event-42
+event: update
+retry: 1500
+data: first line
+data: second line
+
+data: final event without trailing delimiter
