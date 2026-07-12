@@ -30,11 +30,13 @@ final class URLSessionStreamingHTTPClientTests: XCTestCase {
     }
 
     func testCancellingBodyConsumerCancelsUnderlyingURLSessionTask() async throws {
+        let stopLoadingProbe = StopLoadingProbe()
         URLProtocolFixture.install(
             statusCode: 200,
             headers: ["Content-Type": "text/event-stream"],
             bodyChunks: [],
-            stallsAfterResponse: true
+            stallsAfterResponse: true,
+            onStopLoading: { stopLoadingProbe.record() }
         )
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [URLProtocolFixture.self]
@@ -57,15 +59,45 @@ final class URLSessionStreamingHTTPClientTests: XCTestCase {
         } catch is CancellationError {
             // Expected.
         }
-        XCTAssertEqual(URLProtocolFixture.stopLoadingCount(), 1)
+        XCTAssertTrue(
+            stopLoadingProbe.waitForStopLoading(timeout: 2),
+            "Cancelling body iteration must eventually invoke URLProtocol.stopLoading()"
+        )
+        XCTAssertEqual(stopLoadingProbe.count, 1)
     }
 }
+
+private final class StopLoadingProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let firstStop = DispatchSemaphore(value: 0)
+    private var stopCount = 0
+
+    var count: Int {
+        lock.withLock { stopCount }
+    }
+
+    func record() {
+        let isFirstStop = lock.withLock { () -> Bool in
+            stopCount += 1
+            return stopCount == 1
+        }
+        if isFirstStop {
+            firstStop.signal()
+        }
+    }
+
+    func waitForStopLoading(timeout: TimeInterval) -> Bool {
+        firstStop.wait(timeout: .now() + timeout) == .success
+    }
+}
+
 private final class URLProtocolFixture: URLProtocol, @unchecked Sendable {
     struct Response: Sendable {
         var statusCode: Int
         var headers: [String: String]
         var bodyChunks: [Data]
         var stallsAfterResponse: Bool
+        var onStopLoading: (@Sendable () -> Void)?
     }
 
     private static let lock = NSLock()
@@ -73,35 +105,33 @@ private final class URLProtocolFixture: URLProtocol, @unchecked Sendable {
         statusCode: 200,
         headers: [:],
         bodyChunks: [],
-        stallsAfterResponse: false
+        stallsAfterResponse: false,
+        onStopLoading: nil
     )
     nonisolated(unsafe) private static var capturedRequest: URLRequest?
-    nonisolated(unsafe) private static var stops = 0
+    private var onStopLoading: (@Sendable () -> Void)?
 
     static func install(
         statusCode: Int,
         headers: [String: String],
         bodyChunks: [Data],
-        stallsAfterResponse: Bool = false
+        stallsAfterResponse: Bool = false,
+        onStopLoading: (@Sendable () -> Void)? = nil
     ) {
         lock.withLock {
             fixture = Response(
                 statusCode: statusCode,
                 headers: headers,
                 bodyChunks: bodyChunks,
-                stallsAfterResponse: stallsAfterResponse
+                stallsAfterResponse: stallsAfterResponse,
+                onStopLoading: onStopLoading
             )
             capturedRequest = nil
-            stops = 0
         }
     }
 
     static func lastRequestHeader(named name: String) -> String? {
         lock.withLock { capturedRequest?.value(forHTTPHeaderField: name) }
-    }
-
-    static func stopLoadingCount() -> Int {
-        lock.withLock { stops }
     }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -113,6 +143,7 @@ private final class URLProtocolFixture: URLProtocol, @unchecked Sendable {
             Self.capturedRequest = request
             return Self.fixture
         }
+        onStopLoading = response.onStopLoading
         guard let httpResponse = HTTPURLResponse(
             url: request.url!,
             statusCode: response.statusCode,
@@ -131,6 +162,6 @@ private final class URLProtocolFixture: URLProtocol, @unchecked Sendable {
     }
 
     override func stopLoading() {
-        Self.lock.withLock { Self.stops += 1 }
+        onStopLoading?()
     }
 }

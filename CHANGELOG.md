@@ -5,6 +5,14 @@ All notable changes to AgentRuntimeKit are documented here. The project follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-13
+
+### Fixed
+
+- Made the URLSession cancellation contract test wait for the asynchronous
+  `URLProtocol.stopLoading()` callback while still requiring exactly one
+  underlying-task cancellation.
+
 ## [0.1.0] - 2026-07-13
 
 ### Added
@@ -24,5 +32,6 @@ All notable changes to AgentRuntimeKit are documented here. The project follows
 - Opt-in live Anthropic contracts for streaming, continuation, tools,
   cancellation, and sanitized authentication failures.
 
-[Unreleased]: https://github.com/midagedev/AgentRuntimeKit/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/midagedev/AgentRuntimeKit/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/midagedev/AgentRuntimeKit/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/midagedev/AgentRuntimeKit/releases/tag/v0.1.0
