@@ -1,7 +1,13 @@
 .DS_Store
 .build/
 .swiftpm/
+Package.resolved
 DerivedData/
+xcuserdata/
 *.xcresult
-*.xcuserdata
 *.xcodeproj
+*.xcworkspace
+.env
+.env.*
+!.env.example
+.xcode.env.local

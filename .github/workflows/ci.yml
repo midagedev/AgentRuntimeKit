@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  swift:
+    name: Swift build and tests
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - name: Toolchain
+        run: swift --version
+      - name: Secret pattern scan
+        run: ./Scripts/check-secrets.sh
+      - name: Build with warnings as errors
+        run: swift build -Xswiftc -warnings-as-errors
+      - name: Test
+        run: swift test --parallel
+      - name: Public API compatibility
+        shell: bash
+        run: |
+          baseline="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1)"
+          if [[ -n "$baseline" && "$baseline" != "$GITHUB_REF_NAME" ]]; then
+            swift package diagnose-api-breaking-changes "$baseline"
+          else
+            echo "No previous release tag to compare."
+          fi
+
+  apple-platforms:
+    name: Apple platform compile
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: iOS Simulator
+        run: >-
+          xcodebuild -scheme AgentRuntimeApple
+          -destination 'generic/platform=iOS Simulator'
+          CODE_SIGNING_ALLOWED=NO SWIFT_TREAT_WARNINGS_AS_ERRORS=YES build
+      - name: watchOS Simulator
+        run: >-
+          xcodebuild -scheme AgentRuntimeApple
+          -destination 'generic/platform=watchOS Simulator'
+          CODE_SIGNING_ALLOWED=NO SWIFT_TREAT_WARNINGS_AS_ERRORS=YES build
+      - name: tvOS Simulator
+        run: >-
+          xcodebuild -scheme AgentRuntimeApple
+          -destination 'generic/platform=tvOS Simulator'
+          CODE_SIGNING_ALLOWED=NO SWIFT_TREAT_WARNINGS_AS_ERRORS=YES build

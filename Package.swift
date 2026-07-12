@@ -70,5 +70,13 @@ let package = Package(
             name: "AgentRuntimeTestKitTests",
             dependencies: ["AgentRuntimeTestKit", "AgentRuntimeCore"]
         ),
+        .testTarget(
+            name: "AgentRuntimeLiveTests",
+            dependencies: [
+                "AgentRuntimeCore",
+                "AgentRuntimeProviders",
+                "AgentRuntimeTestKit",
+            ]
+        ),
     ]
 )

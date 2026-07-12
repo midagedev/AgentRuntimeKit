@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/midagedev/AgentRuntimeKit/security/advisories/new
+    about: Report security and privacy issues privately.
+  - name: Integration discussion
+    url: https://github.com/midagedev/AgentRuntimeKit/discussions
+    about: Ask integration questions and discuss designs.

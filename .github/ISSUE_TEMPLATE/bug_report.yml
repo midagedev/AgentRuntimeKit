@@ -1,0 +1,62 @@
+name: Bug report
+description: Report a reproducible AgentRuntimeKit defect
+title: "[Bug]: "
+labels: [bug, triage]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include credentials, provider bodies, memory content, health data, or private tool arguments. Report security issues privately.
+  - type: input
+    id: version
+    attributes:
+      label: AgentRuntimeKit version
+      placeholder: 0.1.0 or commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: product
+    attributes:
+      label: Product
+      multiple: true
+      options:
+        - AgentRuntimeCore
+        - AgentRuntimeProviders
+        - AgentRuntimeMemory
+        - AgentRuntimeApple
+        - AgentRuntimeMCP
+        - AgentRuntimeTestKit
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: Swift 6.x, Xcode, platform and OS
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include sanitized code or a small public repository.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed API keys, authorization headers, memory content, health data, and private tool arguments.
+          required: true

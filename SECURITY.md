@@ -1,4 +1,29 @@
-# Security Model
+# Security Policy and Model
+
+## Supported versions
+
+Security fixes are provided for the latest minor release. Before 1.0, a fix may
+include a narrowly scoped source-compatible hardening change in a patch release.
+
+| Version | Supported |
+| --- | --- |
+| 0.1.x | Yes |
+| Earlier/unreleased snapshots | No |
+
+## Reporting a vulnerability
+
+Use [GitHub private vulnerability reporting](https://github.com/midagedev/AgentRuntimeKit/security/advisories/new).
+Do not open a public issue for a credential leak, privacy-scope violation,
+approval bypass, unsafe tool replay, checkpoint corruption, or remote transport
+vulnerability.
+
+Include the affected version, platform, smallest sanitized reproduction, impact,
+and whether exploitation requires a malicious provider, tool, MCP endpoint, or
+host integration. Do not include real API keys, provider request bodies, memory
+content, health data, or private tool arguments.
+
+The maintainers will acknowledge a complete report within seven days, coordinate
+a fix and disclosure window, and credit reporters who request attribution.
 
 ## Credentials
 

@@ -1,5 +1,11 @@
 # AgentRuntimeKit
 
+[![CI](https://github.com/midagedev/AgentRuntimeKit/actions/workflows/ci.yml/badge.svg)](https://github.com/midagedev/AgentRuntimeKit/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/midagedev/AgentRuntimeKit/actions/workflows/codeql.yml/badge.svg)](https://github.com/midagedev/AgentRuntimeKit/actions/workflows/codeql.yml)
+[![Swift 6](https://img.shields.io/badge/Swift-6-F05138.svg?logo=swift)](https://www.swift.org)
+[![Platforms](https://img.shields.io/badge/platforms-iOS%2017%2B%20%7C%20macOS%2014%2B%20%7C%20watchOS%2010%2B%20%7C%20tvOS%2017%2B-lightgrey.svg)](#requirements)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A headless, provider-neutral agent runtime for Swift applications. It gives an
 Apple app one bounded execution model for streaming LLMs, native tools, user
 approval, scoped memory, Keychain credentials, checkpoints, audit records, and
@@ -8,6 +14,32 @@ optional remote MCP tools.
 AgentRuntimeKit intentionally contains no SwiftUI. Dochi and YKPT are the first
 two host applications and keep their own domain models, interfaces, and consent
 flows.
+
+The package is designed for apps that need more than a chat completion wrapper:
+provider-owned reasoning continuation, bounded native tool execution, explicit
+approval, crash-safe side-effect recovery, scoped local memory, and Apple-native
+credential and file protection.
+
+## Installation
+
+Add the package URL in Xcode:
+
+```text
+https://github.com/midagedev/AgentRuntimeKit.git
+```
+
+Choose a version requirement starting at `0.1.0`, then add only the products
+your target needs. SwiftPM consumers can declare:
+
+```swift
+.package(
+    url: "https://github.com/midagedev/AgentRuntimeKit.git",
+    from: "0.1.0"
+)
+```
+
+See [Getting Started](Documentation/GETTING_STARTED.md) and the
+[Production Integration Checklist](Documentation/INTEGRATION_CHECKLIST.md).
 
 ## Requirements
 
@@ -139,6 +171,12 @@ result immediately afterward. A crash, timeout, or uncertain native failure leav
 an unresolved or indeterminate record and stops the run for host reconciliation;
 it is never silently replayed.
 
+Custom `AgentCheckpointStore` conformers remain source-compatible, but the default
+`unresolved` and `reconcile` implementations deliberately fail closed. A production
+store must enumerate every unresolved execution for the complete identity, including
+older checkpoints hidden by a newer save, and atomically append the matching tool
+result when reconciliation succeeds.
+
 See [Architecture](Documentation/ARCHITECTURE.md) and [Security](SECURITY.md).
 
 ## Validation
@@ -151,3 +189,25 @@ swift test
 
 Provider, memory, Apple adapter, MCP, core loop, and test-kit suites use mocked
 network, Keychain, and temporary-file boundaries. No test requires a live API key.
+An opt-in Anthropic contract suite covers real streaming, usage, multi-turn opaque
+continuation, a tool round trip, cancellation, and sanitized authentication errors:
+
+```sh
+AGENT_RUNTIME_LIVE_ANTHROPIC=1 \
+ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+swift test --filter AnthropicLiveTests
+```
+
+The live suite is skipped by default and CI never receives a provider credential.
+
+## Community
+
+- Read [Contributing](CONTRIBUTING.md) before proposing public API or safety
+  changes.
+- Use [GitHub Discussions](https://github.com/midagedev/AgentRuntimeKit/discussions)
+  for integration questions.
+- Report vulnerabilities through [private vulnerability reporting](SECURITY.md),
+  never a public issue.
+- Releases and migration notes are tracked in [CHANGELOG.md](CHANGELOG.md).
+
+AgentRuntimeKit is available under the [MIT License](LICENSE).

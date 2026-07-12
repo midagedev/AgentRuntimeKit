@@ -1,0 +1,11 @@
+version: 1
+builder:
+  configs:
+    - platform: macos-spm
+      scheme: AgentRuntimeCore
+    - platform: ios
+      scheme: AgentRuntimeApple
+    - platform: watchos
+      scheme: AgentRuntimeApple
+    - platform: tvos
+      scheme: AgentRuntimeApple
