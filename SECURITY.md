@@ -75,7 +75,9 @@ a fix and disclosure window, and credit reporters who request attribution.
   Expired records are not returned as active context.
 - Apple hosts handling sensitive data should use `ProtectedSQLiteMemoryStore`,
   which reapplies permissions and Data Protection attributes to the database,
-  WAL, and SHM files.
+  WAL, and SHM files. iOS-family platforms apply the selected Data Protection
+  class; macOS enforces owner-only POSIX modes because ordinary macOS paths do
+  not support `NSFileProtection` attributes.
 - Privacy erasure uses hard-purge APIs, not the recoverable deleted status. Exact
   purge never widens a namespace. Owner purge requires an exact app/user pair and
   excludes application-wide and user-unbound records while covering that user's

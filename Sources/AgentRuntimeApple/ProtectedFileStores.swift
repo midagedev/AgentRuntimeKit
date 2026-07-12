@@ -17,6 +17,12 @@ public enum AgentFileProtection: String, Sendable, Codable, Hashable {
     }
 
     fileprivate var writingOption: Data.WritingOptions {
+#if os(macOS)
+        // NSFileProtection attributes are unavailable for ordinary macOS
+        // filesystem paths. macOS stores still enforce owner-only POSIX modes;
+        // iOS-family hosts additionally receive Data Protection classes.
+        .noFileProtection
+#else
         switch self {
         case .complete: .completeFileProtection
         case .completeUnlessOpen: .completeFileProtectionUnlessOpen
@@ -24,6 +30,7 @@ public enum AgentFileProtection: String, Sendable, Codable, Hashable {
             .completeFileProtectionUntilFirstUserAuthentication
         case .none: .noFileProtection
         }
+#endif
     }
 }
 
@@ -92,17 +99,23 @@ private struct ProtectedAgentFileStorage {
     }
 
     var directoryAttributes: [FileAttributeKey: Any] {
-        [
+        var attributes: [FileAttributeKey: Any] = [
             .posixPermissions: NSNumber(value: Int16(0o700)),
-            .protectionKey: protection.foundationValue,
         ]
+#if !os(macOS)
+        attributes[.protectionKey] = protection.foundationValue
+#endif
+        return attributes
     }
 
     var fileAttributes: [FileAttributeKey: Any] {
-        [
+        var attributes: [FileAttributeKey: Any] = [
             .posixPermissions: NSNumber(value: Int16(0o600)),
-            .protectionKey: protection.foundationValue,
         ]
+#if !os(macOS)
+        attributes[.protectionKey] = protection.foundationValue
+#endif
+        return attributes
     }
 }
 
