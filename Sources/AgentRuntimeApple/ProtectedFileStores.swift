@@ -106,6 +106,18 @@ private struct ProtectedAgentFileStorage {
     }
 }
 
+private struct ProtectedCheckpointEnvelope: Codable {
+    static let currentFormatVersion = 1
+
+    var formatVersion: Int
+    var checkpoint: AgentRunCheckpoint
+
+    init(checkpoint: AgentRunCheckpoint) {
+        formatVersion = Self.currentFormatVersion
+        self.checkpoint = checkpoint
+    }
+}
+
 /// Stores each checkpoint as an atomically replaced, protected JSON document.
 public actor ProtectedFileAgentCheckpointStore: AgentCheckpointStore {
     public struct Configuration: Sendable, Hashable {
@@ -142,7 +154,7 @@ public actor ProtectedFileAgentCheckpointStore: AgentCheckpointStore {
 
     public func save(_ checkpoint: AgentRunCheckpoint) throws {
         try Task.checkCancellation()
-        let data = try encoder.encode(checkpoint)
+        let data = try encoder.encode(ProtectedCheckpointEnvelope(checkpoint: checkpoint))
         try storage.writeAtomically(data, to: url(for: checkpoint.id))
         // Retention is best effort after the requested checkpoint is safely on disk.
         // A cleanup failure must not turn a successful write-ahead save into an
@@ -155,7 +167,7 @@ public actor ProtectedFileAgentCheckpointStore: AgentCheckpointStore {
         let url = url(for: id)
         guard storage.fileManager.fileExists(atPath: url.path) else { return nil }
         try storage.ensureRegularDestination(url)
-        return try decoder.decode(AgentRunCheckpoint.self, from: Data(contentsOf: url))
+        return try decodeCheckpoint(at: url)
     }
 
     public func latest(
@@ -178,10 +190,7 @@ public actor ProtectedFileAgentCheckpointStore: AgentCheckpointStore {
             try Task.checkCancellation()
             let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
             guard values.isRegularFile == true, values.isSymbolicLink != true else { continue }
-            let checkpoint = try decoder.decode(
-                AgentRunCheckpoint.self,
-                from: Data(contentsOf: url)
-            )
+            guard let checkpoint = try? decodeCheckpoint(at: url) else { continue }
             guard checkpoint.appID == appID,
                   checkpoint.userID == userID,
                   checkpoint.sessionID == sessionID,
@@ -219,12 +228,16 @@ public actor ProtectedFileAgentCheckpointStore: AgentCheckpointStore {
         for url in urls where url.pathExtension == "json" {
             try Task.checkCancellation()
             let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
-            guard values.isRegularFile == true, values.isSymbolicLink != true,
-                  let checkpoint = try? decoder.decode(
-                      AgentRunCheckpoint.self,
-                      from: Data(contentsOf: url)
-                  ),
-                  checkpoint.appID == appID,
+            guard values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+            let checkpoint: AgentRunCheckpoint
+            do {
+                checkpoint = try decodeCheckpoint(at: url)
+            } catch {
+                throw AgentCheckpointStoreError.corruptCheckpoint(
+                    UUID(uuidString: url.deletingPathExtension().lastPathComponent)
+                )
+            }
+            guard checkpoint.appID == appID,
                   checkpoint.userID == userID,
                   checkpoint.sessionID == sessionID,
                   checkpoint.agentID == agentID
@@ -234,10 +247,85 @@ public actor ProtectedFileAgentCheckpointStore: AgentCheckpointStore {
         }
     }
 
+    public func unresolved(
+        appID: String,
+        userID: String?,
+        sessionID: String,
+        agentID: String
+    ) async throws -> [AgentUnresolvedToolExecution] {
+        try Task.checkCancellation()
+        guard storage.fileManager.fileExists(atPath: storage.directory.path) else { return [] }
+        try storage.prepareDirectory()
+        let urls = try storage.fileManager.contentsOfDirectory(
+            at: storage.directory,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles]
+        )
+        var result: [AgentUnresolvedToolExecution] = []
+        for url in urls where url.pathExtension == "json" {
+            try Task.checkCancellation()
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            guard values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+            let checkpoint: AgentRunCheckpoint
+            do {
+                checkpoint = try decodeCheckpoint(at: url)
+            } catch {
+                throw AgentCheckpointStoreError.corruptCheckpoint(
+                    UUID(uuidString: url.deletingPathExtension().lastPathComponent)
+                )
+            }
+            guard checkpoint.appID == appID,
+                  checkpoint.userID == userID,
+                  checkpoint.sessionID == sessionID,
+                  checkpoint.agentID == agentID
+            else { continue }
+            result.append(contentsOf: checkpoint.unresolvedNonIdempotentToolExecutions.map {
+                AgentUnresolvedToolExecution(
+                    checkpointID: checkpoint.id,
+                    checkpointCreatedAt: checkpoint.createdAt,
+                    record: $0
+                )
+            })
+        }
+        return result.sorted {
+            if $0.checkpointCreatedAt == $1.checkpointCreatedAt {
+                return $0.record.callID < $1.record.callID
+            }
+            return $0.checkpointCreatedAt < $1.checkpointCreatedAt
+        }
+    }
+
+    public func reconcile(
+        _ reconciliation: AgentToolExecutionReconciliation
+    ) async throws -> AgentRunCheckpoint {
+        try Task.checkCancellation()
+        guard let checkpoint = try load(id: reconciliation.checkpointID) else {
+            throw AgentCheckpointStoreError.checkpointNotFound(reconciliation.checkpointID)
+        }
+        let updated = try checkpoint.reconciling(reconciliation)
+        try save(updated)
+        return updated
+    }
+
     private func url(for id: UUID) -> URL {
         storage.directory
             .appendingPathComponent(id.uuidString.lowercased(), isDirectory: false)
             .appendingPathExtension("json")
+    }
+
+    private func decodeCheckpoint(at url: URL) throws -> AgentRunCheckpoint {
+        let data = try Data(contentsOf: url)
+        if let envelope = try? decoder.decode(ProtectedCheckpointEnvelope.self, from: data) {
+            guard envelope.formatVersion == ProtectedCheckpointEnvelope.currentFormatVersion else {
+                throw AgentCheckpointStoreError.corruptCheckpoint(
+                    UUID(uuidString: url.deletingPathExtension().lastPathComponent)
+                )
+            }
+            return envelope.checkpoint
+        }
+        // Version 0 stored AgentRunCheckpoint directly. Reading it is the
+        // migration; the next save atomically rewrites it in the envelope.
+        return try decoder.decode(AgentRunCheckpoint.self, from: data)
     }
 
     private func pruneCheckpoints(olderThan saved: AgentRunCheckpoint) throws {
@@ -250,10 +338,7 @@ public actor ProtectedFileAgentCheckpointStore: AgentCheckpointStore {
         for url in urls where url.pathExtension == "json" {
             let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
             guard values.isRegularFile == true, values.isSymbolicLink != true,
-                  let checkpoint = try? decoder.decode(
-                      AgentRunCheckpoint.self,
-                      from: Data(contentsOf: url)
-                  ),
+                  let checkpoint = try? decodeCheckpoint(at: url),
                   checkpoint.appID == saved.appID,
                   checkpoint.userID == saved.userID,
                   checkpoint.sessionID == saved.sessionID,
@@ -261,7 +346,10 @@ public actor ProtectedFileAgentCheckpointStore: AgentCheckpointStore {
             else { continue }
             matching.append((url, checkpoint))
         }
+        // Automatic retention must never erase evidence of a write whose
+        // external effect still requires host reconciliation.
         let obsolete = matching
+            .filter { $0.checkpoint.unresolvedNonIdempotentToolExecutions.isEmpty }
             .sorted { $0.checkpoint.createdAt > $1.checkpoint.createdAt }
             .dropFirst(maximumCheckpointsPerIdentity)
         for entry in obsolete {

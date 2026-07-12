@@ -191,7 +191,7 @@ public actor AgentRuntime {
     private let approvalHandler: any AgentToolApprovalHandler
     private let checkpointStore: (any AgentCheckpointStore)?
     private let auditSink: (any AgentAuditSink)?
-    private var sessionToolApprovals: [AgentSessionApprovalScope: Set<String>] = [:]
+    private var sessionToolApprovals: [AgentSessionApprovalScope: Set<AgentToolDescriptor>] = [:]
 
     public init(
         providers: ModelProviderRegistry,
@@ -260,9 +260,7 @@ public actor AgentRuntime {
 
         if let checkpoint = request.resumeFrom {
             try validateResume(checkpoint, for: request)
-            if let unresolved = checkpoint.toolExecutions.first(where: {
-                $0.sideEffect == .nonIdempotent && $0.state != .completed
-            }) {
+            if let unresolved = checkpoint.unresolvedNonIdempotentToolExecutions.first {
                 throw AgentRuntimeError.nonIdempotentToolRequiresReconciliation(
                     callID: unresolved.callID,
                     toolName: unresolved.toolName
@@ -280,6 +278,49 @@ public actor AgentRuntime {
                 provider: provider.identifier,
                 capability: "tool calling"
             )
+        }
+        let durableMessages = request.resumeFrom?.messages ?? request.messages
+        let containsImages = durableMessages.contains { message in
+            message.content.contains { content in
+                if case .image = content { return true }
+                return false
+            }
+        }
+        if containsImages && !provider.capabilities.contains(.vision) {
+            throw AgentRuntimeError.providerCapabilityMissing(
+                provider: provider.identifier,
+                capability: "vision"
+            )
+        }
+        if request.responseSchema != nil && !provider.capabilities.contains(.structuredOutput) {
+            throw AgentRuntimeError.providerCapabilityMissing(
+                provider: provider.identifier,
+                capability: "structured output"
+            )
+        }
+
+        if let checkpointStore {
+            let unresolved: [AgentUnresolvedToolExecution]
+            do {
+                unresolved = try await checkpointStore.unresolved(
+                    appID: request.appID,
+                    userID: request.userID,
+                    sessionID: request.sessionID,
+                    agentID: request.agent.id
+                )
+            } catch AgentCheckpointStoreError.completeUnresolvedQueryUnsupported {
+                throw AgentRuntimeError.checkpointFailed(
+                    "unresolved execution safety is unavailable"
+                )
+            } catch {
+                throw AgentRuntimeError.checkpointFailed("unresolved execution query failed")
+            }
+            if let unresolved = unresolved.first {
+                throw AgentRuntimeError.nonIdempotentToolRequiresReconciliation(
+                    callID: unresolved.record.callID,
+                    toolName: unresolved.record.toolName
+                )
+            }
         }
 
         // Only this transcript is durable. Instructions and context are composed
@@ -663,7 +704,8 @@ public actor AgentRuntime {
                 agentID: request.agent.id,
                 sessionID: request.sessionID
             )
-            if sessionToolApprovals[approvalScope]?.contains(call.name) != true {
+            let descriptor = tool.descriptor
+            if sessionToolApprovals[approvalScope]?.contains(descriptor) != true {
                 let approvalRequest = AgentToolApprovalRequest(
                     call: call,
                     descriptor: tool.descriptor,
@@ -675,7 +717,7 @@ public actor AgentRuntime {
                 case .allowOnce:
                     break
                 case .allowForSession:
-                    sessionToolApprovals[approvalScope, default: []].insert(call.name)
+                    sessionToolApprovals[approvalScope, default: []].insert(descriptor)
                 case .deny(let denial):
                     return .rejected(emitToolFailure(
                         call,

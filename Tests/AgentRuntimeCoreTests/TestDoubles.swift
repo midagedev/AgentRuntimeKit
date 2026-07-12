@@ -83,12 +83,13 @@ actor RecordingTool: AgentTool {
         name: String = "echo",
         risk: AgentToolRisk = .safe,
         sideEffect: AgentToolSideEffect = .none,
+        inputSchema: JSONValue? = nil,
         output: AgentToolOutput = AgentToolOutput(text: "ok")
     ) {
         descriptor = AgentToolDescriptor(
             name: name,
             description: "Echoes a value",
-            inputSchema: .object([
+            inputSchema: inputSchema ?? .object([
                 "type": .string("object"),
                 "properties": .object([
                     "value": .object(["type": .string("string")]),
@@ -185,6 +186,33 @@ actor CountingApprovalHandler: AgentToolApprovalHandler {
     func requestApproval(_ request: AgentToolApprovalRequest) async -> AgentToolApprovalDecision {
         count += 1
         return decision
+    }
+}
+
+actor LegacyCheckpointStore: AgentCheckpointStore {
+    private var checkpoints: [UUID: AgentRunCheckpoint] = [:]
+
+    func save(_ checkpoint: AgentRunCheckpoint) { checkpoints[checkpoint.id] = checkpoint }
+    func load(id: UUID) -> AgentRunCheckpoint? { checkpoints[id] }
+    func latest(
+        appID: String,
+        userID: String?,
+        sessionID: String,
+        agentID: String
+    ) -> AgentRunCheckpoint? {
+        checkpoints.values
+            .filter {
+                $0.appID == appID && $0.userID == userID
+                    && $0.sessionID == sessionID && $0.agentID == agentID
+            }
+            .max { $0.createdAt < $1.createdAt }
+    }
+    func delete(id: UUID) { checkpoints[id] = nil }
+    func deleteAll(appID: String, userID: String?, sessionID: String, agentID: String) {
+        checkpoints = checkpoints.filter { _, checkpoint in
+            checkpoint.appID != appID || checkpoint.userID != userID
+                || checkpoint.sessionID != sessionID || checkpoint.agentID != agentID
+        }
     }
 }
 

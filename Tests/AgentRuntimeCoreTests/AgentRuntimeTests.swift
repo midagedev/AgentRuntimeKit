@@ -85,6 +85,54 @@ final class AgentRuntimeTests: XCTestCase {
         XCTAssertEqual(sensitiveToolCallCount, 2)
     }
 
+    func testSessionApprovalIsInvalidatedWhenToolDescriptorChanges() async throws {
+        let firstCall = AgentToolCall(
+            id: "first",
+            name: "private.read",
+            arguments: ["value": "one"]
+        )
+        let secondCall = AgentToolCall(
+            id: "second",
+            name: "private.read",
+            arguments: ["value": "two", "confirmed": true]
+        )
+        let provider = ScriptedProvider(scripts: [
+            [.toolCall(firstCall), .finish(.toolCalls)], [.textDelta("first"), .finish(.stop)],
+            [.toolCall(secondCall), .finish(.toolCalls)], [.textDelta("second"), .finish(.stop)],
+        ])
+        let firstTool = RecordingTool(name: "private.read", risk: .sensitive)
+        let tools = try AgentToolRegistry(tools: [firstTool])
+        let approvals = CountingApprovalHandler(decision: .allowForSession)
+        let runtime = AgentRuntime(
+            providers: ModelProviderRegistry(providers: [provider]),
+            tools: tools,
+            approvalHandler: approvals
+        )
+
+        _ = try await collectEvents(runtime.run(makeRequest(sessionID: "shared")))
+        let replacement = RecordingTool(
+            name: "private.read",
+            risk: .sensitive,
+            sideEffect: .idempotent,
+            inputSchema: [
+                "type": "object",
+                "properties": [
+                    "value": ["type": "string"],
+                    "confirmed": ["type": "boolean"],
+                ],
+                "required": ["value", "confirmed"],
+                "additionalProperties": false,
+            ]
+        )
+        try await tools.replace(replacement)
+        _ = try await collectEvents(runtime.run(makeRequest(sessionID: "shared")))
+
+        let approvalCount = await approvals.count
+        let replacementCallCount = await replacement.calls.count
+        XCTAssertEqual(approvalCount, 2)
+        XCTAssertEqual(replacementCallCount, 1)
+    }
+
     func testContextSensitivityAndPromptInjectionBoundary() async throws {
         let provider = ScriptedProvider(scripts: [[.textDelta("ok"), .finish(.stop)]])
         let context = TestContextProvider(blocks: [
@@ -388,6 +436,158 @@ final class AgentRuntimeTests: XCTestCase {
         XCTAssertEqual(count, 0)
     }
 
+    func testFreshRunRejectsOlderUnresolvedNonIdempotentExecutionHiddenByNewerCheckpoint() async throws {
+        let checkpoints = InMemoryAgentCheckpointStore()
+        let unresolved = makeStoredCheckpoint(
+            createdAt: Date(timeIntervalSince1970: 10),
+            toolExecutions: [AgentToolExecutionRecord(
+                callID: "write-hidden",
+                toolName: "write",
+                sideEffect: .nonIdempotent,
+                state: .indeterminate
+            )]
+        )
+        let newer = makeStoredCheckpoint(createdAt: Date(timeIntervalSince1970: 20))
+        await checkpoints.save(unresolved)
+        await checkpoints.save(newer)
+        let provider = ScriptedProvider(scripts: [[.textDelta("must not run")]])
+        let runtime = AgentRuntime(
+            providers: ModelProviderRegistry(providers: [provider]),
+            tools: try AgentToolRegistry(),
+            checkpointStore: checkpoints
+        )
+
+        do {
+            _ = try await collectEvents(runtime.run(makeRequest()))
+            XCTFail("Expected reconciliation gate")
+        } catch let error as AgentRuntimeError {
+            XCTAssertEqual(error, .nonIdempotentToolRequiresReconciliation(
+                callID: "write-hidden",
+                toolName: "write"
+            ))
+        }
+        let providerRequestCount = await provider.state.requests.count
+        XCTAssertEqual(providerRequestCount, 0)
+    }
+
+    func testExplicitReconciliationPersistsToolResultAndAllowsResume() async throws {
+        let checkpoints = InMemoryAgentCheckpointStore()
+        let call = AgentToolCall(id: "write-1", name: "write", arguments: ["value": "x"])
+        var checkpoint = makeStoredCheckpoint(
+            messages: [AgentMessage(role: .assistant, content: [.toolCall(call)])],
+            toolExecutions: [AgentToolExecutionRecord(
+                callID: call.id,
+                toolName: call.name,
+                sideEffect: .nonIdempotent,
+                state: .indeterminate
+            )]
+        )
+        await checkpoints.save(checkpoint)
+        let result = AgentToolResultContent(
+            toolCallID: call.id,
+            toolName: call.name,
+            content: ["status": "confirmed"],
+            summary: "The host confirmed the external effect."
+        )
+
+        checkpoint = try await checkpoints.reconcile(AgentToolExecutionReconciliation(
+            checkpointID: checkpoint.id,
+            callID: call.id,
+            outcome: .effectApplied,
+            result: result
+        ))
+
+        let unresolved = try await checkpoints.unresolved(
+            appID: "tests",
+            userID: "user",
+            sessionID: "session",
+            agentID: "assistant"
+        )
+        XCTAssertTrue(unresolved.isEmpty)
+        XCTAssertEqual(checkpoint.toolExecutions.first?.state, .completed)
+        XCTAssertEqual(checkpoint.messages.last?.toolResults.first, result)
+
+        let provider = ScriptedProvider(scripts: [[.textDelta("continued"), .finish(.stop)]])
+        let runtime = AgentRuntime(
+            providers: ModelProviderRegistry(providers: [provider]),
+            tools: try AgentToolRegistry(),
+            checkpointStore: checkpoints
+        )
+        var request = makeRequest()
+        request.resumeFrom = checkpoint
+        let events = try await collectEvents(runtime.run(request))
+        guard case .completed(let runResult) = events.last else {
+            return XCTFail("Expected completion")
+        }
+        XCTAssertEqual(runResult.finalMessage.text, "continued")
+    }
+
+    func testLegacyToolExecutionRecordDecodesWithoutReconciliationOutcome() throws {
+        let data = Data(#"{"callID":"call","toolName":"write","sideEffect":"nonIdempotent","state":"indeterminate","startedAt":0}"#.utf8)
+
+        let record = try JSONDecoder().decode(AgentToolExecutionRecord.self, from: data)
+
+        XCTAssertEqual(record.callID, "call")
+        XCTAssertEqual(record.state, .indeterminate)
+        XCTAssertNil(record.reconciliationOutcome)
+    }
+
+    func testLegacyCheckpointStoreFailsClosedUntilItImplementsUnresolvedQuery() async throws {
+        let provider = ScriptedProvider(scripts: [[.textDelta("must not run")]])
+        let runtime = AgentRuntime(
+            providers: ModelProviderRegistry(providers: [provider]),
+            tools: try AgentToolRegistry(),
+            checkpointStore: LegacyCheckpointStore()
+        )
+
+        do {
+            _ = try await collectEvents(runtime.run(makeRequest()))
+            XCTFail("Expected checkpoint safety failure")
+        } catch let error as AgentRuntimeError {
+            XCTAssertEqual(error, .checkpointFailed(
+                "unresolved execution safety is unavailable"
+            ))
+        }
+        let providerRequestCount = await provider.state.requests.count
+        XCTAssertEqual(providerRequestCount, 0)
+    }
+
+    func testVisionAndStructuredOutputCapabilitiesAreCheckedBeforeProviderCall() async throws {
+        let provider = ScriptedProvider(
+            capabilities: [.streaming],
+            scripts: [[.textDelta("must not run")], [.textDelta("must not run")]]
+        )
+        let runtime = AgentRuntime(
+            providers: ModelProviderRegistry(providers: [provider]),
+            tools: try AgentToolRegistry()
+        )
+        var visionRequest = makeRequest()
+        visionRequest.messages = [AgentMessage(role: .user, content: [
+            .text("Describe"),
+            .image(AgentImage(source: .base64(mediaType: "image/png", data: "AA=="))),
+        ])]
+        do {
+            _ = try await collectEvents(runtime.run(visionRequest))
+            XCTFail("Expected vision capability rejection")
+        } catch let error as AgentRuntimeError {
+            XCTAssertEqual(error, .providerCapabilityMissing(provider: "test", capability: "vision"))
+        }
+
+        var schemaRequest = makeRequest()
+        schemaRequest.responseSchema = ["type": "object"]
+        do {
+            _ = try await collectEvents(runtime.run(schemaRequest))
+            XCTFail("Expected structured output capability rejection")
+        } catch let error as AgentRuntimeError {
+            XCTAssertEqual(error, .providerCapabilityMissing(
+                provider: "test",
+                capability: "structured output"
+            ))
+        }
+        let providerRequestCount = await provider.state.requests.count
+        XCTAssertEqual(providerRequestCount, 0)
+    }
+
     func testDuplicateToolBatchIsRejectedBeforeAnySideEffect() async throws {
         let duplicateID = "duplicate"
         let calls = [
@@ -486,4 +686,26 @@ final class AgentRuntimeTests: XCTestCase {
         let encoded = try JSONEncoder().encode(failure)
         XCTAssertFalse(String(decoding: encoded, as: UTF8.self).contains("sk-super-secret"))
     }
+}
+
+private func makeStoredCheckpoint(
+    messages: [AgentMessage] = [AgentMessage(role: .user, text: "hello")],
+    createdAt: Date = .now,
+    toolExecutions: [AgentToolExecutionRecord] = []
+) -> AgentRunCheckpoint {
+    AgentRunCheckpoint(
+        runID: UUID(),
+        sessionID: "session",
+        appID: "tests",
+        userID: "user",
+        agentID: "assistant",
+        providerID: "test",
+        model: "test-model",
+        messages: messages,
+        stepCount: 1,
+        toolCallCount: toolExecutions.count,
+        usage: AgentTokenUsage(),
+        toolExecutions: toolExecutions,
+        createdAt: createdAt
+    )
 }

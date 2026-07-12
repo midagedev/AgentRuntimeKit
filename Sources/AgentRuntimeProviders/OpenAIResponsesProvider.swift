@@ -226,8 +226,13 @@ private struct OpenAIResponsesStreamState {
             let error = json["error"] ?? json["response"]?["error"] ?? json
             throw ProviderStreamError(
                 providerIdentifier: providerIdentifier,
-                message: error["message"]?.stringValue ?? "OpenAI Responses stream failed",
-                code: error["code"]?.stringValue ?? error["type"]?.stringValue
+                message: sanitizedProviderErrorMessage(
+                    error["message"]?.stringValue ?? "OpenAI Responses stream failed",
+                    fallback: "OpenAI Responses stream failed"
+                ),
+                code: sanitizedProviderDiagnosticIdentifier(
+                    error["code"]?.stringValue ?? error["type"]?.stringValue
+                )
             )
         case "response.created", "response.in_progress":
             let response = json["response"] ?? json

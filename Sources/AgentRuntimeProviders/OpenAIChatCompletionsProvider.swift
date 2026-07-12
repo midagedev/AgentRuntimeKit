@@ -218,8 +218,13 @@ private struct OpenAIChatStreamState {
         if let error = json["error"] {
             throw ProviderStreamError(
                 providerIdentifier: providerIdentifier,
-                message: error["message"]?.stringValue ?? "OpenAI-compatible stream failed",
-                code: error["code"]?.stringValue ?? error["type"]?.stringValue
+                message: sanitizedProviderErrorMessage(
+                    error["message"]?.stringValue ?? "OpenAI-compatible stream failed",
+                    fallback: "OpenAI-compatible stream failed"
+                ),
+                code: sanitizedProviderDiagnosticIdentifier(
+                    error["code"]?.stringValue ?? error["type"]?.stringValue
+                )
             )
         }
 

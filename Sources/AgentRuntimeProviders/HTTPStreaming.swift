@@ -87,31 +87,25 @@ public struct URLSessionStreamingHTTPClient: StreamingHTTPClient, @unchecked Sen
         }
 
         let chunkSize = self.chunkSize
-        let body = AsyncThrowingStream<Data, Error> { continuation in
-            let task = Task {
-                do {
-                    var chunk = Data()
-                    chunk.reserveCapacity(chunkSize)
-                    for try await byte in bytes {
-                        try Task.checkCancellation()
-                        chunk.append(byte)
-                        if chunk.count >= chunkSize {
-                            continuation.yield(chunk)
-                            chunk.removeAll(keepingCapacity: true)
-                        }
-                    }
-                    if !chunk.isEmpty {
-                        continuation.yield(chunk)
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
+        let sessionTask = bytes.task
+        let reader = URLSessionByteChunkReader(bytes: bytes, chunkSize: chunkSize)
+        let body = AsyncThrowingStream<Data, Error>(unfolding: {
+            do {
+                return try await withTaskCancellationHandler {
+                    try await reader.next()
+                } onCancel: {
+                    sessionTask.cancel()
                 }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                if Task.isCancelled {
+                    sessionTask.cancel()
+                    throw CancellationError()
+                }
+                throw error
             }
-            continuation.onTermination = { @Sendable _ in
-                task.cancel()
-            }
-        }
+        })
 
         var headers: [String: String] = [:]
         for (key, value) in httpResponse.allHeaderFields {
@@ -122,5 +116,38 @@ public struct URLSessionStreamingHTTPClient: StreamingHTTPClient, @unchecked Sen
             headers: headers,
             body: body
         )
+    }
+}
+
+/// Mutable iterator state for the documented single-consumer response body.
+/// `AsyncThrowingStream` serializes calls to its unfolding closure; the box is
+/// never exposed and therefore cannot be iterated concurrently.
+private final class URLSessionByteChunkReader: @unchecked Sendable {
+    private var iterator: URLSession.AsyncBytes.Iterator
+    private let chunkSize: Int
+
+    init(bytes: URLSession.AsyncBytes, chunkSize: Int) {
+        self.iterator = bytes.makeAsyncIterator()
+        self.chunkSize = chunkSize
+    }
+
+    func next() async throws -> Data? {
+        try Task.checkCancellation()
+        var chunk = Data()
+        chunk.reserveCapacity(chunkSize)
+        while chunk.count < chunkSize {
+            guard let byte = try await iterator.next() else {
+                return chunk.isEmpty ? nil : chunk
+            }
+            try Task.checkCancellation()
+            chunk.append(byte)
+            // Provider streams are line-oriented (SSE or NDJSON). Flushing at
+            // a newline preserves real incremental delivery even when a short
+            // response never reaches the byte bound.
+            if byte == 0x0A {
+                return chunk
+            }
+        }
+        return chunk
     }
 }

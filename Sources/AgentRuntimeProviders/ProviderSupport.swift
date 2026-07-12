@@ -77,8 +77,10 @@ func makeModelEventStream(
             do {
                 try await operation(continuation)
                 continuation.finish()
+            } catch is CancellationError {
+                continuation.finish(throwing: CancellationError())
             } catch {
-                continuation.finish(throwing: error)
+                continuation.finish(throwing: Task.isCancelled ? CancellationError() : error)
             }
         }
         continuation.onTermination = { @Sendable _ in
@@ -104,16 +106,62 @@ func validateSuccessfulResponse(
     }
     let body = data.isEmpty ? nil : String(decoding: data, as: UTF8.self)
     let parsed = body.flatMap { try? JSONValue.parse($0) }
-    let message = parsed?.providerErrorMessage
-        ?? HTTPURLResponse.localizedString(forStatusCode: response.statusCode)
-    let requestID = response.header(named: "x-request-id")
-        ?? response.header(named: "request-id")
+    let fallbackMessage = HTTPURLResponse.localizedString(forStatusCode: response.statusCode)
+    let message = sanitizedProviderErrorMessage(
+        parsed?.providerErrorMessage ?? fallbackMessage,
+        fallback: fallbackMessage
+    )
+    let requestID = sanitizedProviderDiagnosticIdentifier(
+        response.header(named: "x-request-id")
+            ?? response.header(named: "request-id")
+    )
     throw ProviderHTTPError(
         statusCode: response.statusCode,
         message: message,
         requestID: requestID,
         rateLimit: normalizedRateLimit(from: response)
     )
+}
+
+/// Provider error text is untrusted and may echo credentials, local paths, or
+/// prompt data. Preserve short diagnostic prose while redacting common secret
+/// shapes and bounding what can enter UI/logging through typed errors.
+func sanitizedProviderErrorMessage(_ message: String, fallback: String) -> String {
+    var value = message.unicodeScalars.map { scalar -> Character in
+        if CharacterSet.controlCharacters.contains(scalar) { return " " }
+        return Character(String(scalar))
+    }.reduce(into: "") { $0.append($1) }
+    value = value.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+
+    let patterns = [
+        #"(?i)(bearer\s+)[^\s,;]+"#,
+        #"(?i)\b(?:sk|rk|pk)-[A-Za-z0-9_-]{8,}\b"#,
+        #"(?i)(?:api[_ -]?key|access[_ -]?token|secret|password)\s*[:=]\s*[^\s,;]+"#,
+        #"/(?:Users|private|var|home|tmp)/[^\s,;]+"#,
+        #"\b[A-Za-z0-9+/=_-]{48,}\b"#,
+    ]
+    for pattern in patterns {
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { continue }
+        let range = NSRange(value.startIndex..<value.endIndex, in: value)
+        value = expression.stringByReplacingMatches(
+            in: value,
+            range: range,
+            withTemplate: "[REDACTED]"
+        )
+    }
+    value = String(value.prefix(512)).trimmingCharacters(in: .whitespacesAndNewlines)
+    return value.isEmpty ? fallback : value
+}
+
+func sanitizedProviderDiagnosticIdentifier(_ value: String?) -> String? {
+    guard let value else { return nil }
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty, trimmed.count <= 128 else { return nil }
+    let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._:-"))
+    guard trimmed.unicodeScalars.allSatisfy(allowed.contains) else { return nil }
+    let redacted = sanitizedProviderErrorMessage(trimmed, fallback: "")
+    guard !redacted.contains("[REDACTED]") else { return nil }
+    return trimmed
 }
 
 func processSSE(

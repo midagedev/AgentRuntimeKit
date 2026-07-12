@@ -104,6 +104,130 @@ final class AgentRuntimeAppleTests: XCTestCase {
         XCTAssertEqual(preservedUnrelated, unrelated)
     }
 
+    func testCheckpointRetentionNeverPrunesUnresolvedNonIdempotentExecution() async throws {
+        let temporary = try TemporaryDirectory()
+        let directory = temporary.url.appendingPathComponent("retained-checkpoints", isDirectory: true)
+        let store = ProtectedFileAgentCheckpointStore(configuration: .init(
+            directory: directory,
+            maximumCheckpointsPerIdentity: 1
+        ))
+        var unresolved = makeCheckpoint(createdAt: Date(timeIntervalSince1970: 10))
+        unresolved.toolExecutions = [AgentToolExecutionRecord(
+            callID: "write-1",
+            toolName: "write",
+            sideEffect: .nonIdempotent,
+            state: .indeterminate
+        )]
+        let completed = makeCheckpoint(createdAt: Date(timeIntervalSince1970: 20))
+        let newest = makeCheckpoint(createdAt: Date(timeIntervalSince1970: 30))
+
+        try await store.save(unresolved)
+        try await store.save(completed)
+        try await store.save(newest)
+
+        let retainedUnresolved = try await store.load(id: unresolved.id)
+        let prunedCompleted = try await store.load(id: completed.id)
+        let retainedNewest = try await store.load(id: newest.id)
+        XCTAssertEqual(retainedUnresolved, unresolved)
+        XCTAssertNil(prunedCompleted)
+        XCTAssertEqual(retainedNewest, newest)
+        let unresolvedRecords = try await store.unresolved(
+            appID: "app",
+            userID: nil,
+            sessionID: "session",
+            agentID: "agent"
+        )
+        XCTAssertEqual(unresolvedRecords.map(\.record.callID), ["write-1"])
+    }
+
+    func testProtectedCheckpointStoreReadsLegacyJSONAndMigratesOnSave() async throws {
+        let temporary = try TemporaryDirectory()
+        let directory = temporary.url.appendingPathComponent("legacy-checkpoints", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let checkpoint = makeCheckpoint(createdAt: Date(timeIntervalSince1970: 10))
+        let url = directory
+            .appendingPathComponent(checkpoint.id.uuidString.lowercased())
+            .appendingPathExtension("json")
+        try JSONEncoder().encode(checkpoint).write(to: url, options: .atomic)
+        let store = ProtectedFileAgentCheckpointStore(configuration: .init(directory: directory))
+
+        let loaded = try await store.load(id: checkpoint.id)
+        XCTAssertEqual(loaded, checkpoint)
+        try await store.save(checkpoint)
+
+        let migrated = try JSONValue.parse(Data(contentsOf: url))
+        XCTAssertEqual(migrated["formatVersion"], .number(1))
+        XCTAssertNotNil(migrated["checkpoint"])
+    }
+
+    func testProtectedCheckpointStoreReconcilesAndFailsClosedOnCorruptFile() async throws {
+        let temporary = try TemporaryDirectory()
+        let directory = temporary.url.appendingPathComponent("reconciliation", isDirectory: true)
+        let store = ProtectedFileAgentCheckpointStore(configuration: .init(directory: directory))
+        var checkpoint = makeCheckpoint(createdAt: Date(timeIntervalSince1970: 10))
+        checkpoint.messages = [AgentMessage(role: .assistant, content: [.toolCall(AgentToolCall(
+            id: "write-1",
+            name: "write",
+            arguments: [:]
+        ))])]
+        checkpoint.toolExecutions = [AgentToolExecutionRecord(
+            callID: "write-1",
+            toolName: "write",
+            sideEffect: .nonIdempotent,
+            state: .started
+        )]
+        try await store.save(checkpoint)
+        let unresolved = try await store.unresolved(
+            appID: "app",
+            userID: nil,
+            sessionID: "session",
+            agentID: "agent"
+        )
+        XCTAssertEqual(unresolved.count, 1)
+        let reconciled = try await store.reconcile(AgentToolExecutionReconciliation(
+            checkpointID: checkpoint.id,
+            callID: "write-1",
+            outcome: .effectNotApplied,
+            result: AgentToolResultContent(
+                toolCallID: "write-1",
+                toolName: "write",
+                content: ["status": "not_applied"],
+                isError: true
+            )
+        ))
+
+        XCTAssertEqual(reconciled.toolExecutions.first?.state, .completed)
+        let remaining = try await store.unresolved(
+            appID: "app",
+            userID: nil,
+            sessionID: "session",
+            agentID: "agent"
+        )
+        try Data("not-json".utf8).write(
+            to: directory.appendingPathComponent("corrupt.json"),
+            options: .atomic
+        )
+        let latest = try await store.latest(
+            appID: "app",
+            userID: nil,
+            sessionID: "session",
+            agentID: "agent"
+        )
+        XCTAssertTrue(remaining.isEmpty)
+        XCTAssertEqual(latest?.id, checkpoint.id)
+        do {
+            _ = try await store.unresolved(
+                appID: "app",
+                userID: nil,
+                sessionID: "session",
+                agentID: "agent"
+            )
+            XCTFail("Expected corrupt checkpoint safety failure")
+        } catch let error as AgentCheckpointStoreError {
+            XCTAssertEqual(error, .corruptCheckpoint(nil))
+        }
+    }
+
     func testJSONLAuditSinkRedactsNestedCredentialsAndAppendsRecords() async throws {
         let temporary = try TemporaryDirectory()
         let file = temporary.url.appendingPathComponent("audit/events.jsonl")

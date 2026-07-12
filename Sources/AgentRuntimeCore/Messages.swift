@@ -126,4 +126,11 @@ public struct AgentMessage: Sendable, Codable, Hashable, Identifiable {
             return nil
         }
     }
+
+    public var toolResults: [AgentToolResultContent] {
+        content.compactMap { item in
+            if case .toolResult(let value) = item { return value }
+            return nil
+        }
+    }
 }

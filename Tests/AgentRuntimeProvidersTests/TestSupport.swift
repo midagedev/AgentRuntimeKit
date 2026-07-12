@@ -91,6 +91,65 @@ struct StubModelProvider: ModelProvider, Sendable {
     }
 }
 
+actor RecordingProviderState {
+    private var scripts: [[ModelStreamEvent]]
+    private(set) var requests: [ModelRequest] = []
+
+    init(scripts: [[ModelStreamEvent]]) {
+        self.scripts = scripts
+    }
+
+    func next(for request: ModelRequest) throws -> [ModelStreamEvent] {
+        requests.append(request)
+        guard !scripts.isEmpty else { throw ProviderTestError.noFixture }
+        return scripts.removeFirst()
+    }
+}
+
+struct RecordingStubModelProvider: ModelProvider, Sendable {
+    let identifier: String
+    let capabilities: ProviderCapabilities
+    let state: RecordingProviderState
+
+    init(
+        identifier: String,
+        capabilities: ProviderCapabilities = [.streaming, .tools],
+        scripts: [[ModelStreamEvent]]
+    ) {
+        self.identifier = identifier
+        self.capabilities = capabilities
+        state = RecordingProviderState(scripts: scripts)
+    }
+
+    func stream(_ request: ModelRequest) -> AsyncThrowingStream<ModelStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    for event in try await state.next(for: request) {
+                        try Task.checkCancellation()
+                        continuation.yield(event)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { @Sendable _ in task.cancel() }
+        }
+    }
+}
+
+actor ProviderFixtureTool: AgentTool {
+    nonisolated let descriptor = fixtureTool
+
+    func execute(
+        arguments: JSONValue,
+        context: AgentToolExecutionContext
+    ) async throws -> AgentToolOutput {
+        AgentToolOutput(content: ["temperature": 27])
+    }
+}
+
 func loadFixture(_ name: String) throws -> Data {
     let testDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
     return try Data(contentsOf: testDirectory.appendingPathComponent(".Fixtures/\(name)"))

@@ -211,8 +211,13 @@ private struct GeminiStreamState {
         if let error = json["error"] {
             throw ProviderStreamError(
                 providerIdentifier: providerIdentifier,
-                message: error["message"]?.stringValue ?? "Gemini stream failed",
-                code: error["status"]?.stringValue ?? error["code"]?.intValue.map(String.init)
+                message: sanitizedProviderErrorMessage(
+                    error["message"]?.stringValue ?? "Gemini stream failed",
+                    fallback: "Gemini stream failed"
+                ),
+                code: sanitizedProviderDiagnosticIdentifier(
+                    error["status"]?.stringValue ?? error["code"]?.intValue.map(String.init)
+                )
             )
         }
 

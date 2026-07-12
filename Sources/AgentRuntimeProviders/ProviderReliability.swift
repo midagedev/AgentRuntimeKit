@@ -247,14 +247,41 @@ public struct FallbackModelProvider: ModelProvider, Sendable {
                 throw AgentRuntimeError.providerNotFound(identifier)
             }
 
-            for (index, provider) in providers.enumerated() {
+            let routed = try routedRequest(request)
+            let candidates: [any ModelProvider]
+            if let pinnedIdentifier = routed.pinnedProviderIdentifier {
+                guard let pinned = providers.first(where: { $0.identifier == pinnedIdentifier }) else {
+                    throw AgentRuntimeError.invalidProviderResponse(
+                        "Fallback continuation references an unavailable provider."
+                    )
+                }
+                candidates = [pinned]
+            } else {
+                candidates = providers
+            }
+
+            for (index, provider) in candidates.enumerated() {
                 var staged: [ModelStreamEvent] = [
                     .metadata(["fallbackProvider": .string(provider.identifier)]),
                 ]
                 var committed = false
                 do {
-                    for try await event in provider.stream(request) {
+                    for try await childEvent in provider.stream(routed.request) {
                         try Task.checkCancellation()
+                        let event: ModelStreamEvent
+                        if case .providerContinuation(let childContinuation) = childEvent {
+                            guard childContinuation.providerIdentifier == provider.identifier else {
+                                throw AgentRuntimeError.invalidProviderResponse(
+                                    "Fallback child continuation identifier did not match its adapter."
+                                )
+                            }
+                            event = .providerContinuation(try route(
+                                childContinuation,
+                                childProviderIdentifier: provider.identifier
+                            ))
+                        } else {
+                            event = childEvent
+                        }
                         if committed {
                             continuation.yield(event)
                         } else {
@@ -273,13 +300,80 @@ public struct FallbackModelProvider: ModelProvider, Sendable {
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
-                    if committed || index == providers.index(before: providers.endIndex) {
+                    if committed || index == candidates.index(before: candidates.endIndex) {
                         throw error
                     }
                     // Drop metadata/usage from the failed, uncommitted provider and try next.
                 }
             }
         }
+    }
+
+    private struct RoutedRequest {
+        var pinnedProviderIdentifier: String?
+        var request: ModelRequest
+    }
+
+    private static let routeFormat = "agent-runtime.fallback-route"
+    private static let routeFormatVersion = 1
+
+    private func routedRequest(_ request: ModelRequest) throws -> RoutedRequest {
+        var pinnedProviderIdentifier: String?
+        var messages: [AgentMessage] = []
+        messages.reserveCapacity(request.messages.count)
+
+        for var message in request.messages {
+            guard let continuation = message.providerContinuation else {
+                messages.append(message)
+                continue
+            }
+            guard continuation.providerIdentifier == identifier,
+                  continuation.format == Self.routeFormat,
+                  continuation.formatVersion == Self.routeFormatVersion,
+                  let object = continuation.payload.objectValue,
+                  let childProviderIdentifier = object["providerIdentifier"]?.stringValue,
+                  let encodedChild = object["continuation"],
+                  let child = try? JSONDecoder().decode(
+                      ProviderContinuation.self,
+                      from: encodedChild.encodedData()
+                  ),
+                  child.providerIdentifier == childProviderIdentifier else {
+                throw AgentRuntimeError.invalidProviderResponse(
+                    "Fallback continuation routing envelope is invalid."
+                )
+            }
+            if let pinnedProviderIdentifier,
+               pinnedProviderIdentifier != childProviderIdentifier {
+                throw AgentRuntimeError.invalidProviderResponse(
+                    "Fallback transcript contains continuations from multiple providers."
+                )
+            }
+            pinnedProviderIdentifier = childProviderIdentifier
+            message.providerContinuation = child
+            messages.append(message)
+        }
+
+        var routed = request
+        routed.messages = messages
+        return RoutedRequest(
+            pinnedProviderIdentifier: pinnedProviderIdentifier,
+            request: routed
+        )
+    }
+
+    private func route(
+        _ continuation: ProviderContinuation,
+        childProviderIdentifier: String
+    ) throws -> ProviderContinuation {
+        ProviderContinuation(
+            providerIdentifier: identifier,
+            format: Self.routeFormat,
+            formatVersion: Self.routeFormatVersion,
+            payload: .object([
+                "providerIdentifier": .string(childProviderIdentifier),
+                "continuation": try JSONValue.parse(JSONEncoder().encode(continuation)),
+            ])
+        )
     }
 }
 

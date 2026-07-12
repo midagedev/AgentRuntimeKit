@@ -70,6 +70,33 @@ final class ProviderReliabilityTests: XCTestCase {
         }
     }
 
+    func testProviderErrorMessageRedactsEchoedCredentialAndLocalPath() async throws {
+        let body = Data(#"{"error":{"message":"Invalid API key: sk-live-supersecret at /Users/alice/private.json"}}"#.utf8)
+        let transport = FixtureHTTPClient([
+            FixtureHTTPResponse(
+                statusCode: 401,
+                headers: ["X-Request-ID": "Bearer sk-request-secret"],
+                chunks: [body]
+            ),
+        ])
+        let provider = OpenAIChatCompletionsProvider(
+            credentialResolver: StaticProviderCredentialResolver(credential: "unrelated-key"),
+            retryPolicy: .none,
+            httpClient: transport
+        )
+
+        do {
+            _ = try await collectEvents(provider.stream(fixtureRequest()))
+            XCTFail("Expected HTTP error")
+        } catch let error as ProviderHTTPError {
+            XCTAssertEqual(error.statusCode, 401)
+            XCTAssertTrue(error.message.contains("[REDACTED]"))
+            XCTAssertFalse(error.message.contains("sk-live-supersecret"))
+            XCTAssertFalse(error.localizedDescription.contains("/Users/alice"))
+            XCTAssertNil(error.requestID)
+        }
+    }
+
     func testFallbackMovesOnBeforeContent() async throws {
         let failing = StubModelProvider(identifier: "first", failure: .fixtureFailure)
         let succeeding = StubModelProvider(
@@ -112,5 +139,152 @@ final class ProviderReliabilityTests: XCTestCase {
             XCTAssertEqual(error as? ProviderTestError, .fixtureFailure)
         }
         XCTAssertEqual(textOutput(events), "already emitted")
+    }
+
+    func testFallbackPinsOpaqueContinuationToSelectedProviderAcrossToolLoop() async throws {
+        let childContinuation = ProviderContinuation(
+            providerIdentifier: "second",
+            format: "signed-state",
+            payload: ["signature": "opaque"]
+        )
+        let first = StubModelProvider(identifier: "first", failure: .fixtureFailure)
+        let second = RecordingStubModelProvider(identifier: "second", scripts: [
+            [
+                .toolCall(AgentToolCall(id: "call-1", name: "weather", arguments: ["city": "Seoul"])),
+                .providerContinuation(childContinuation),
+                .finish(.toolCalls),
+            ],
+            [.textDelta("done"), .finish(.stop)],
+        ])
+        let fallback = FallbackModelProvider(providers: [first, second])
+        let initial = ModelRequest(
+            model: "fixture-model",
+            messages: [AgentMessage(role: .user, text: "Weather?")],
+            tools: [fixtureTool]
+        )
+
+        let firstEvents = try await collectEvents(fallback.stream(initial))
+        let routed = try XCTUnwrap(finalContinuation(firstEvents))
+        XCTAssertEqual(routed.providerIdentifier, "fallback")
+        XCTAssertNotEqual(routed.payload, childContinuation.payload)
+
+        let assistant = AgentMessage(
+            role: .assistant,
+            content: [.toolCall(AgentToolCall(
+                id: "call-1",
+                name: "weather",
+                arguments: ["city": "Seoul"]
+            ))],
+            providerContinuation: routed
+        )
+        let followUp = ModelRequest(
+            model: "fixture-model",
+            messages: [
+                initial.messages[0],
+                assistant,
+                AgentMessage(role: .tool, content: [.toolResult(AgentToolResultContent(
+                    toolCallID: "call-1",
+                    toolName: "weather",
+                    content: ["temperature": 27]
+                ))]),
+            ],
+            tools: [fixtureTool]
+        )
+
+        let secondEvents = try await collectEvents(fallback.stream(followUp))
+
+        XCTAssertEqual(textOutput(secondEvents), "done")
+        let requests = await second.state.requests
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(
+            requests[1].messages.first(where: { $0.role == .assistant })?.providerContinuation,
+            childContinuation
+        )
+    }
+
+    func testFallbackRoutedContinuationPassesRuntimeAdapterValidation() async throws {
+        let continuation = ProviderContinuation(
+            providerIdentifier: "second",
+            format: "signed-state",
+            payload: ["signature": "opaque"]
+        )
+        let child = RecordingStubModelProvider(identifier: "second", scripts: [
+            [
+                .toolCall(AgentToolCall(
+                    id: "call-1",
+                    name: "weather",
+                    arguments: ["city": "Seoul"]
+                )),
+                .providerContinuation(continuation),
+                .finish(.toolCalls),
+            ],
+            [.textDelta("done"), .finish(.stop)],
+        ])
+        let fallback = FallbackModelProvider(
+            providers: [StubModelProvider(identifier: "first", failure: .fixtureFailure), child]
+        )
+        let runtime = AgentRuntime(
+            providers: ModelProviderRegistry(providers: [fallback]),
+            tools: try AgentToolRegistry(tools: [ProviderFixtureTool()])
+        )
+        let request = AgentRunRequest(
+            sessionID: "session",
+            appID: "tests",
+            agent: AgentDefinition(
+                id: "assistant",
+                providerID: fallback.identifier,
+                model: "model",
+                instructions: "Be concise."
+            ),
+            messages: [AgentMessage(role: .user, text: "Weather in Seoul?")]
+        )
+
+        var events: [AgentEvent] = []
+        for try await event in runtime.run(request) { events.append(event) }
+
+        guard case .completed(let result) = events.last else {
+            return XCTFail("Expected completed runtime event")
+        }
+        XCTAssertEqual(result.finalMessage.text, "done")
+        XCTAssertEqual(
+            result.messages.first(where: { !$0.toolCalls.isEmpty })?.providerContinuation?
+                .providerIdentifier,
+            fallback.identifier
+        )
+        let requests = await child.state.requests
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(
+            requests[1].messages.first(where: { !$0.toolCalls.isEmpty })?.providerContinuation,
+            continuation
+        )
+    }
+
+    func testFallbackRejectsCorruptRoutingEnvelopeWithoutTryingAnotherProvider() async throws {
+        let first = RecordingStubModelProvider(identifier: "first", scripts: [[.textDelta("unsafe")]])
+        let fallback = FallbackModelProvider(providers: [first])
+        let corrupt = ProviderContinuation(
+            providerIdentifier: "fallback",
+            format: "agent-runtime.fallback-route",
+            payload: ["providerIdentifier": "missing"]
+        )
+        let request = ModelRequest(
+            model: "model",
+            messages: [AgentMessage(
+                role: .assistant,
+                content: [.text("partial")],
+                providerContinuation: corrupt
+            )]
+        )
+
+        do {
+            _ = try await collectEvents(fallback.stream(request))
+            XCTFail("Expected corrupt continuation rejection")
+        } catch let error as AgentRuntimeError {
+            guard case .invalidProviderResponse = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+        let requestCount = await first.state.requests.count
+        XCTAssertEqual(requestCount, 0)
     }
 }

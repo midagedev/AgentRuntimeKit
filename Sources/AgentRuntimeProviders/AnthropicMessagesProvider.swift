@@ -202,8 +202,11 @@ private struct AnthropicStreamState {
             let error = json["error"] ?? json
             throw ProviderStreamError(
                 providerIdentifier: providerIdentifier,
-                message: error["message"]?.stringValue ?? "Unknown Anthropic stream error",
-                code: error["type"]?.stringValue
+                message: sanitizedProviderErrorMessage(
+                    error["message"]?.stringValue ?? "Unknown Anthropic stream error",
+                    fallback: "Unknown Anthropic stream error"
+                ),
+                code: sanitizedProviderDiagnosticIdentifier(error["type"]?.stringValue)
             )
         case "message_start":
             if let message = json["message"] {
