@@ -330,17 +330,17 @@ public actor SQLiteMemoryStore: MemoryStore {
             guard try find(database, id: id, scope: scope) != nil else {
                 return MemoryPurgeResult()
             }
-            return try withEventDeletionEnabled(database) {
-                let result = try purgeRecords(
-                    database,
-                    where: "id = ? AND \(Self.exactScopePredicate)",
-                    bindings: [.text(id.uuidString)] + scopeBindings(scope)
-                )
-                if result.recordsPurged > 0, try fullTextSearchTableExists(database) {
-                    try rebuildFullTextIndex(database)
-                }
-                return result
+            try removeEventDeletionGuard(database)
+            let result = try purgeRecords(
+                database,
+                where: "id = ? AND \(Self.exactScopePredicate)",
+                bindings: [.text(id.uuidString)] + scopeBindings(scope)
+            )
+            if result.recordsPurged > 0, try fullTextSearchTableExists(database) {
+                try rebuildFullTextIndex(database)
             }
+            try restoreEventDeletionGuard(database)
+            return result
         }
         // A retry after an interrupted cleanup is intentionally useful even
         // when the record was already gone: it can finish compaction and WAL
@@ -355,23 +355,23 @@ public actor SQLiteMemoryStore: MemoryStore {
 
         let result = try transaction {
             let database = try openDatabase()
-            return try withEventDeletionEnabled(database) {
-                var aggregate = MemoryPurgeResult()
-                for scope in exactScopes {
-                    let partial = try purgeRecords(
-                        database,
-                        where: Self.exactScopePredicate,
-                        bindings: scopeBindings(scope)
-                    )
-                    aggregate.recordsPurged += partial.recordsPurged
-                    aggregate.eventsPurged += partial.eventsPurged
-                    aggregate.fullTextEntriesPurged += partial.fullTextEntriesPurged
-                }
-                if aggregate.recordsPurged > 0, try fullTextSearchTableExists(database) {
-                    try rebuildFullTextIndex(database)
-                }
-                return aggregate
+            try removeEventDeletionGuard(database)
+            var aggregate = MemoryPurgeResult()
+            for scope in exactScopes {
+                let partial = try purgeRecords(
+                    database,
+                    where: Self.exactScopePredicate,
+                    bindings: scopeBindings(scope)
+                )
+                aggregate.recordsPurged += partial.recordsPurged
+                aggregate.eventsPurged += partial.eventsPurged
+                aggregate.fullTextEntriesPurged += partial.fullTextEntriesPurged
             }
+            if aggregate.recordsPurged > 0, try fullTextSearchTableExists(database) {
+                try rebuildFullTextIndex(database)
+            }
+            try restoreEventDeletionGuard(database)
+            return aggregate
         }
         return try finishPhysicalPurge(result)
     }
@@ -395,17 +395,17 @@ public actor SQLiteMemoryStore: MemoryStore {
         let bindings = try ownerBindings(appID: appID, userID: userID)
         let result = try transaction {
             let database = try openDatabase()
-            return try withEventDeletionEnabled(database) {
-                let result = try purgeRecords(
-                    database,
-                    where: Self.ownedPredicate,
-                    bindings: bindings
-                )
-                if result.recordsPurged > 0, try fullTextSearchTableExists(database) {
-                    try rebuildFullTextIndex(database)
-                }
-                return result
+            try removeEventDeletionGuard(database)
+            let result = try purgeRecords(
+                database,
+                where: Self.ownedPredicate,
+                bindings: bindings
+            )
+            if result.recordsPurged > 0, try fullTextSearchTableExists(database) {
+                try rebuildFullTextIndex(database)
             }
+            try restoreEventDeletionGuard(database)
+            return result
         }
         return try finishPhysicalPurge(result)
     }
@@ -615,10 +615,7 @@ public actor SQLiteMemoryStore: MemoryStore {
         }
     }
 
-    private func withEventDeletionEnabled<T>(
-        _ database: OpaquePointer,
-        operation: () throws -> T
-    ) throws -> T {
+    private func removeEventDeletionGuard(_ database: OpaquePointer) throws {
         // The guard remains authoritative for every ordinary store operation.
         // SQLite DDL is transactional, so any failure rolls the trigger and the
         // purge back together, including across other process connections.
@@ -626,9 +623,10 @@ public actor SQLiteMemoryStore: MemoryStore {
             database,
             sql: "DROP TRIGGER IF EXISTS memory_events_are_append_only_on_delete"
         )
-        let result = try operation()
+    }
+
+    private func restoreEventDeletionGuard(_ database: OpaquePointer) throws {
         try Self.execute(database, sql: Self.createEventDeleteGuardSQL)
-        return result
     }
 
     private func purgeRecords(
