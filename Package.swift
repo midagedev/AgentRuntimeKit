@@ -35,6 +35,7 @@ let package = Package(
         .target(
             name: "AgentRuntimeApple",
             dependencies: ["AgentRuntimeCore", "AgentRuntimeMemory"],
+            resources: [.process("Resources/PrivacyInfo.xcprivacy")],
             linkerSettings: [.linkedFramework("Security")]
         ),
         .target(
@@ -55,7 +56,7 @@ let package = Package(
         ),
         .testTarget(
             name: "AgentRuntimeMemoryTests",
-            dependencies: ["AgentRuntimeMemory", "AgentRuntimeCore"]
+            dependencies: ["AgentRuntimeMemory", "AgentRuntimeCore", "CAgentSQLite"]
         ),
         .testTarget(
             name: "AgentRuntimeAppleTests",

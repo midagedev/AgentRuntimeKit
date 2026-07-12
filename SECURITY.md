@@ -51,6 +51,18 @@
 - Apple hosts handling sensitive data should use `ProtectedSQLiteMemoryStore`,
   which reapplies permissions and Data Protection attributes to the database,
   WAL, and SHM files.
+- Privacy erasure uses hard-purge APIs, not the recoverable deleted status. Exact
+  purge never widens a namespace. Owner purge requires an exact app/user pair and
+  excludes application-wide and user-unbound records while covering that user's
+  historical session scopes.
+- SQLite hard purge removes related events and FTS entries transactionally, enables
+  secure deletion, rebuilds FTS, vacuums obsolete FTS shadow pages, and truncates
+  the WAL. `MemoryPurgeCleanupError` explicitly distinguishes a committed logical
+  purge from an incomplete post-commit cleanup. Hosts remain responsible for
+  retention and erasure policies of backups or filesystem snapshots.
+- `AgentRuntimeApple` declares file-metadata reason C617.1. Protected store URLs
+  used in distributed apps must remain inside the app, app-group, or CloudKit
+  container covered by that reason.
 
 ## Checkpoints and audit
 

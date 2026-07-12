@@ -50,7 +50,7 @@ The package owns:
 - provider request and streaming normalization;
 - the bounded tool-call loop;
 - schema validation, permission decisions, approvals, and audit events;
-- scoped memory storage, retrieval, expiry, and provenance;
+- scoped memory storage, retrieval, expiry, provenance, and privacy purge;
 - Keychain and protected-file adapters;
 - optional remote MCP discovery and calls.
 
@@ -61,6 +61,26 @@ The host app owns:
 - consent for sensitive context;
 - UI, voice, avatar, notifications, and background behavior;
 - whether credentials are user-provided or resolved by a server proxy.
+
+## Memory deletion boundary
+
+Normal memory deletion changes a record's status and retains content-free mutation
+evidence. Privacy purge is a separate, idempotent operation. Record purge requires
+both UUID and exact scope; multi-scope purge validates every complete scope before
+starting one transaction. Owner purge is deliberately narrower than a scope-prefix
+query: it matches one exact app ID and non-empty user ID across user, agent,
+workspace, and historical session scopes, while excluding application-wide and
+user-unbound records.
+
+The SQLite implementation removes record, event, deduplication, and FTS state in
+one write transaction. Append-only event guards are transactionally relaxed only
+inside that purge, then restored before commit. Secure-delete overwrites released
+ordinary cells, FTS is rebuilt from remaining eligible records, the database is
+vacuumed to remove obsolete FTS shadow pages, and the WAL is truncated. If a busy
+reader blocks either post-commit step, `MemoryPurgeCleanupError` carries the
+already-committed counts and the caller can safely retry the same purge. This
+boundary covers the live store artifacts, not platform backups or filesystem
+snapshots controlled outside the process.
 
 ## Compatibility
 

@@ -281,6 +281,9 @@ public typealias AppleProtectedCheckpointStore = ProtectedFileAgentCheckpointSto
 /// this actor keeps future sidecar creation inside the protection boundary.
 public actor ProtectedSQLiteMemoryStore: MemoryStore {
     public struct Configuration: Sendable, Hashable {
+        /// Keep this URL in the app, app-group, or CloudKit container. The
+        /// package privacy manifest declares Apple's C617.1 container reason
+        /// for the file metadata checks used to reject symbolic links.
         public var databaseURL: URL
         public var protection: AgentFileProtection
         public var busyTimeoutMilliseconds: Int
@@ -381,6 +384,51 @@ public actor ProtectedSQLiteMemoryStore: MemoryStore {
             at: date
         )
         try protectArtifacts()
+    }
+
+    public func purge(id: UUID, scope: MemoryScope) async throws -> MemoryPurgeResult {
+        do {
+            let result = try await store.purge(id: id, scope: scope)
+            try protectArtifacts()
+            return result
+        } catch {
+            // SQLite can commit the row purge before physical compaction or a
+            // WAL checkpoint reports a failure. Reapply the file boundary on
+            // both success and failure, and never hide a protection failure.
+            let operationError = error
+            try protectArtifacts()
+            throw operationError
+        }
+    }
+
+    public func purge(scopes: [MemoryScope]) async throws -> MemoryPurgeResult {
+        do {
+            let result = try await store.purge(scopes: scopes)
+            try protectArtifacts()
+            return result
+        } catch {
+            let operationError = error
+            try protectArtifacts()
+            throw operationError
+        }
+    }
+
+    public func recordsOwned(appID: String, userID: String) async throws -> [MemoryRecord] {
+        let records = try await store.recordsOwned(appID: appID, userID: userID)
+        try protectArtifacts()
+        return records
+    }
+
+    public func purgeOwned(appID: String, userID: String) async throws -> MemoryPurgeResult {
+        do {
+            let result = try await store.purgeOwned(appID: appID, userID: userID)
+            try protectArtifacts()
+            return result
+        } catch {
+            let operationError = error
+            try protectArtifacts()
+            throw operationError
+        }
     }
 
     public func retrieve(_ query: MemoryQuery) async throws -> MemoryRetrievalResult {

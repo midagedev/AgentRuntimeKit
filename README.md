@@ -111,6 +111,21 @@ or similarly sensitive source data should normally be supplied as ephemeral
 context rather than written to long-term memory. Context and system instructions
 are composed only for provider requests; they never enter run results or checkpoints.
 
+`delete` is a recoverable status transition. User-facing privacy deletion uses
+the separate idempotent `purge(id:scope:)` or `purge(scopes:)` APIs, which remove
+the record, deduplication identity, mutation events, and full-text artifacts only
+from the exact requested namespace. A memory-management screen that must include
+past sessions can call `recordsOwned(appID:userID:)` and `purgeOwned(appID:userID:)`.
+Those owner-bound APIs include user, agent, workspace, and session records carrying
+that exact app/user pair, while excluding application-wide and user-unbound data.
+SQLite purge runs transactionally with secure deletion, rebuilds FTS, vacuums old
+FTS shadow pages, and truncates the WAL; Apple hosts retain the protected
+database/WAL/SHM boundary. A `MemoryPurgeCleanupError` means the logical delete
+committed but a physical post-commit step must be retried. Existing custom
+`MemoryStore` conformers remain source-compatible and fail closed until they
+implement the purge requirements. Filesystem snapshots and backups remain the
+host platform's retention responsibility.
+
 ## Resume and side-effect rule
 
 Provider-signed or encrypted continuation items are stored opaquely on assistant

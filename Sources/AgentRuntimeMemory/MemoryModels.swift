@@ -354,6 +354,74 @@ public struct MemoryRetrievalResult: Sendable, Codable, Hashable {
     public var records: [MemoryRecord] { hits.map(\.record) }
 }
 
+/// Counts the durable artifacts removed by a privacy purge.
+///
+/// A zero-valued result is a successful no-op. This makes purge safe to retry
+/// after an optimistic UI has raced with another deletion or after a process
+/// was interrupted while cleaning SQLite's write-ahead log.
+public struct MemoryPurgeResult: Sendable, Codable, Hashable {
+    public var recordsPurged: Int
+    public var eventsPurged: Int
+    public var fullTextEntriesPurged: Int
+
+    public init(
+        recordsPurged: Int = 0,
+        eventsPurged: Int = 0,
+        fullTextEntriesPurged: Int = 0
+    ) {
+        self.recordsPurged = recordsPurged
+        self.eventsPurged = eventsPurged
+        self.fullTextEntriesPurged = fullTextEntriesPurged
+    }
+
+    public var didPurgeAnything: Bool {
+        recordsPurged > 0 || eventsPurged > 0 || fullTextEntriesPurged > 0
+    }
+}
+
+/// Reports that the logical purge transaction committed, but a physical
+/// cleanup step did not finish. The same purge call is safe to retry; the
+/// committed counts let a host avoid presenting the retry as a second delete.
+public struct MemoryPurgeCleanupError: Error, Sendable, Equatable, LocalizedError {
+    public enum Stage: String, Sendable, Codable, Hashable {
+        case databaseCompaction
+        case writeAheadLogTruncation
+    }
+
+    public var committedResult: MemoryPurgeResult
+    public var stage: Stage
+    public var underlyingDescription: String
+
+    public init(
+        committedResult: MemoryPurgeResult,
+        stage: Stage,
+        underlyingDescription: String
+    ) {
+        self.committedResult = committedResult
+        self.stage = stage
+        self.underlyingDescription = underlyingDescription
+    }
+
+    public var errorDescription: String? {
+        let step = switch stage {
+        case .databaseCompaction: "database compaction"
+        case .writeAheadLogTruncation: "write-ahead log truncation"
+        }
+        return "The memory purge committed, but \(step) did not finish. "
+            + "Retry the same idempotent purge. \(underlyingDescription)"
+    }
+}
+
+/// A fail-closed capability error used by source-compatible default methods on
+/// custom `MemoryStore` conformers that have not implemented privacy purge.
+public enum MemoryStoreCapabilityError: Error, Sendable, Equatable, LocalizedError {
+    case privacyPurgeUnavailable
+
+    public var errorDescription: String? {
+        "This memory store does not implement privacy purge."
+    }
+}
+
 public enum MemoryEventKind: String, Sendable, Codable, Hashable {
     case created
     case updated

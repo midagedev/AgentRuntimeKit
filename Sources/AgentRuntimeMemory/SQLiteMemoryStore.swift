@@ -7,6 +7,13 @@ public struct SQLiteMemoryStoreDiagnostics: Sendable, Hashable {
     public var busyTimeoutMilliseconds: Int
     public var fullTextSearchAvailable: Bool
     public var appendOnlyEventGuardsInstalled: Bool
+    public var secureDeleteEnabled: Bool
+}
+
+struct SQLiteMemoryArtifactCounts: Sendable, Equatable {
+    var records: Int
+    var events: Int
+    var fullTextEntries: Int
 }
 
 /// Durable, process-safe memory storage. One actor serializes access through a
@@ -34,6 +41,28 @@ public actor SQLiteMemoryStore: MemoryStore {
     }
 
     private static let currentSchemaVersion = 2
+    private static let exactScopePredicate = """
+        scope_level = ? AND app_id = ? AND user_id = ?
+        AND agent_id = ? AND workspace_id = ? AND session_id = ?
+        """
+    private static let ownedPredicate = """
+        scope_level IN (?, ?, ?, ?) AND app_id = ? AND user_id = ?
+        """
+    private static let createEventDeleteGuardSQL = """
+        CREATE TRIGGER memory_events_are_append_only_on_delete
+        BEFORE DELETE ON memory_events
+        BEGIN
+            SELECT RAISE(ABORT, 'memory events are append-only');
+        END
+        """
+    private static let createFullTextSearchSQL = """
+        CREATE VIRTUAL TABLE IF NOT EXISTS memory_records_fts
+        USING fts5(
+            record_id UNINDEXED,
+            content,
+            tokenize = 'unicode61 remove_diacritics 2'
+        )
+        """
 
     public let databaseURL: URL
     private let connection: Connection
@@ -71,6 +100,9 @@ public actor SQLiteMemoryStore: MemoryStore {
                 throw Self.error(from: handle)
             }
             try Self.execute(handle, sql: "PRAGMA foreign_keys = ON")
+            // Hard-purge is a privacy boundary, so deleted cells must be
+            // overwritten rather than merely added to SQLite's freelist.
+            try Self.execute(handle, sql: "PRAGMA secure_delete = ON")
             try Self.execute(handle, sql: "PRAGMA journal_mode = WAL")
             try Self.execute(handle, sql: "PRAGMA synchronous = NORMAL")
             try Self.migrate(handle)
@@ -107,7 +139,24 @@ public actor SQLiteMemoryStore: MemoryStore {
                         'memory_events_are_append_only_on_delete'
                     )
                     """
-            ) == 2
+            ) == 2,
+            secureDeleteEnabled: try Self.scalarInt(database, sql: "PRAGMA secure_delete") == 1
+        )
+    }
+
+    func persistedArtifactCounts(recordID: UUID) throws -> SQLiteMemoryArtifactCounts {
+        let database = try openDatabase()
+        let id = Binding.text(recordID.uuidString)
+        return try SQLiteMemoryArtifactCounts(
+            records: scalarInt(database, sql: "SELECT COUNT(*) FROM memory_records WHERE id = ?", bindings: [id]),
+            events: scalarInt(database, sql: "SELECT COUNT(*) FROM memory_events WHERE record_id = ?", bindings: [id]),
+            fullTextEntries: try fullTextSearchTableExists(database)
+                ? scalarInt(
+                    database,
+                    sql: "SELECT COUNT(*) FROM memory_records_fts WHERE record_id = ?",
+                    bindings: [id]
+                )
+                : 0
         )
     }
 
@@ -272,6 +321,93 @@ public actor SQLiteMemoryStore: MemoryStore {
             expectedRevision: expectedRevision,
             at: date
         )
+    }
+
+    public func purge(id: UUID, scope: MemoryScope) async throws -> MemoryPurgeResult {
+        let scope = try scope.validated()
+        let result = try transaction {
+            let database = try openDatabase()
+            guard try find(database, id: id, scope: scope) != nil else {
+                return MemoryPurgeResult()
+            }
+            return try withEventDeletionEnabled(database) {
+                let result = try purgeRecords(
+                    database,
+                    where: "id = ? AND \(Self.exactScopePredicate)",
+                    bindings: [.text(id.uuidString)] + scopeBindings(scope)
+                )
+                if result.recordsPurged > 0, try fullTextSearchTableExists(database) {
+                    try rebuildFullTextIndex(database)
+                }
+                return result
+            }
+        }
+        // A retry after an interrupted cleanup is intentionally useful even
+        // when the record was already gone: it can finish compaction and WAL
+        // truncation.
+        return try finishPhysicalPurge(result)
+    }
+
+    public func purge(scopes: [MemoryScope]) async throws -> MemoryPurgeResult {
+        let validated = try scopes.map { try $0.validated() }
+        let exactScopes = Array(Set(validated))
+        guard !exactScopes.isEmpty else { return MemoryPurgeResult() }
+
+        let result = try transaction {
+            let database = try openDatabase()
+            return try withEventDeletionEnabled(database) {
+                var aggregate = MemoryPurgeResult()
+                for scope in exactScopes {
+                    let partial = try purgeRecords(
+                        database,
+                        where: Self.exactScopePredicate,
+                        bindings: scopeBindings(scope)
+                    )
+                    aggregate.recordsPurged += partial.recordsPurged
+                    aggregate.eventsPurged += partial.eventsPurged
+                    aggregate.fullTextEntriesPurged += partial.fullTextEntriesPurged
+                }
+                if aggregate.recordsPurged > 0, try fullTextSearchTableExists(database) {
+                    try rebuildFullTextIndex(database)
+                }
+                return aggregate
+            }
+        }
+        return try finishPhysicalPurge(result)
+    }
+
+    public func recordsOwned(appID: String, userID: String) async throws -> [MemoryRecord] {
+        let bindings = try ownerBindings(appID: appID, userID: userID)
+        let database = try openDatabase()
+        return try records(
+            database,
+            sql: """
+                SELECT \(Self.recordColumns)
+                FROM memory_records
+                WHERE \(Self.ownedPredicate)
+                ORDER BY updated_at DESC, id ASC
+                """,
+            bindings: bindings
+        )
+    }
+
+    public func purgeOwned(appID: String, userID: String) async throws -> MemoryPurgeResult {
+        let bindings = try ownerBindings(appID: appID, userID: userID)
+        let result = try transaction {
+            let database = try openDatabase()
+            return try withEventDeletionEnabled(database) {
+                let result = try purgeRecords(
+                    database,
+                    where: Self.ownedPredicate,
+                    bindings: bindings
+                )
+                if result.recordsPurged > 0, try fullTextSearchTableExists(database) {
+                    try rebuildFullTextIndex(database)
+                }
+                return result
+            }
+        }
+        return try finishPhysicalPurge(result)
     }
 
     public func retrieve(_ query: MemoryQuery) throws -> MemoryRetrievalResult {
@@ -472,17 +608,129 @@ public actor SQLiteMemoryStore: MemoryStore {
 
     private static func configureFullTextSearch(_ database: OpaquePointer) -> Bool {
         do {
-            try execute(database, sql: """
-                CREATE VIRTUAL TABLE IF NOT EXISTS memory_records_fts
-                USING fts5(
-                    record_id UNINDEXED,
-                    content,
-                    tokenize = 'unicode61 remove_diacritics 2'
-                )
-                """)
+            try execute(database, sql: createFullTextSearchSQL)
             return true
         } catch {
             return false
+        }
+    }
+
+    private func withEventDeletionEnabled<T>(
+        _ database: OpaquePointer,
+        operation: () throws -> T
+    ) throws -> T {
+        // The guard remains authoritative for every ordinary store operation.
+        // SQLite DDL is transactional, so any failure rolls the trigger and the
+        // purge back together, including across other process connections.
+        try Self.execute(
+            database,
+            sql: "DROP TRIGGER IF EXISTS memory_events_are_append_only_on_delete"
+        )
+        let result = try operation()
+        try Self.execute(database, sql: Self.createEventDeleteGuardSQL)
+        return result
+    }
+
+    private func purgeRecords(
+        _ database: OpaquePointer,
+        where predicate: String,
+        bindings: [Binding]
+    ) throws -> MemoryPurgeResult {
+        let subquery = "SELECT id FROM memory_records WHERE \(predicate)"
+        let fullTextEntries = try fullTextSearchTableExists(database)
+            ? try executePreparedChanges(
+                database,
+                sql: "DELETE FROM memory_records_fts WHERE record_id IN (\(subquery))",
+                bindings: bindings
+            )
+            : 0
+        let events = try executePreparedChanges(
+            database,
+            sql: "DELETE FROM memory_events WHERE record_id IN (\(subquery))",
+            bindings: bindings
+        )
+        let records = try executePreparedChanges(
+            database,
+            sql: "DELETE FROM memory_records WHERE \(predicate)",
+            bindings: bindings
+        )
+        return MemoryPurgeResult(
+            recordsPurged: records,
+            eventsPurged: events,
+            fullTextEntriesPurged: fullTextEntries
+        )
+    }
+
+    private func rebuildFullTextIndex(_ database: OpaquePointer) throws {
+        // FTS5 normally retains old term segments until they are merged. A
+        // privacy purge therefore rebuilds the virtual table from the remaining
+        // non-secret active records instead of relying on delete markers.
+        try Self.execute(database, sql: "DROP TABLE memory_records_fts")
+        try Self.execute(database, sql: Self.createFullTextSearchSQL)
+        try Self.execute(database, sql: """
+            INSERT INTO memory_records_fts(record_id, content)
+            SELECT id, content FROM memory_records
+            WHERE status = 'active' AND sensitivity != 'secret'
+            """)
+        fullTextSearchAvailable = true
+    }
+
+    private func fullTextSearchTableExists(_ database: OpaquePointer) throws -> Bool {
+        try scalarInt(
+            database,
+            sql: """
+                SELECT COUNT(*) FROM sqlite_master
+                WHERE type = 'table' AND name = 'memory_records_fts'
+                """,
+            bindings: []
+        ) == 1
+    }
+
+    private func finishPhysicalPurge(
+        _ committedResult: MemoryPurgeResult
+    ) throws -> MemoryPurgeResult {
+        let database = try openDatabase()
+
+        // SQLite explicitly does not guarantee that core secure_delete scrubs
+        // FTS5 shadow tables. Rebuilding removes logical terms in the atomic
+        // transaction; VACUUM then rewrites the database file from the live
+        // pages so old virtual-table pages are not retained in the file.
+        do {
+            try Self.execute(database, sql: "VACUUM")
+        } catch {
+            throw MemoryPurgeCleanupError(
+                committedResult: committedResult,
+                stage: .databaseCompaction,
+                underlyingDescription: Self.errorDescription(error)
+            )
+        }
+
+        do {
+            try truncateWriteAheadLog()
+        } catch {
+            throw MemoryPurgeCleanupError(
+                committedResult: committedResult,
+                stage: .writeAheadLogTruncation,
+                underlyingDescription: Self.errorDescription(error)
+            )
+        }
+        return committedResult
+    }
+
+    private func truncateWriteAheadLog() throws {
+        let database = try openDatabase()
+        let statement = try prepare(
+            database,
+            sql: "PRAGMA wal_checkpoint(TRUNCATE)",
+            bindings: []
+        )
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw Self.error(from: database)
+        }
+        let busyConnections = sqlite3_column_int64(statement, 0)
+        guard busyConnections == 0 else {
+            throw MemoryStoreError.database("WAL truncation remained busy")
         }
     }
 
@@ -864,6 +1112,18 @@ public actor SQLiteMemoryStore: MemoryStore {
         ]
     }
 
+    private func ownerBindings(appID: String, userID: String) throws -> [Binding] {
+        _ = try MemoryScope.user(appID: appID, userID: userID).validated()
+        return [
+            .text(MemoryScopeLevel.user.rawValue),
+            .text(MemoryScopeLevel.agent.rawValue),
+            .text(MemoryScopeLevel.workspace.rawValue),
+            .text(MemoryScopeLevel.session.rawValue),
+            .text(appID),
+            .text(userID),
+        ]
+    }
+
     private static let recordColumns = """
         id, scope_level, app_id, user_id, agent_id, workspace_id, session_id,
         kind, content, sensitivity, provenance_json, confidence, importance,
@@ -950,6 +1210,28 @@ public actor SQLiteMemoryStore: MemoryStore {
         guard sqlite3_step(statement) == SQLITE_DONE else { throw Self.error(from: database) }
     }
 
+    private func executePreparedChanges(
+        _ database: OpaquePointer,
+        sql: String,
+        bindings: [Binding]
+    ) throws -> Int {
+        let statement = try prepare(database, sql: sql, bindings: bindings)
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_DONE else { throw Self.error(from: database) }
+        return Int(sqlite3_changes(database))
+    }
+
+    private func scalarInt(
+        _ database: OpaquePointer,
+        sql: String,
+        bindings: [Binding]
+    ) throws -> Int {
+        let statement = try prepare(database, sql: sql, bindings: bindings)
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else { throw Self.error(from: database) }
+        return Int(sqlite3_column_int64(statement, 0))
+    }
+
     private static func bind(
         _ value: Binding,
         to statement: OpaquePointer,
@@ -984,6 +1266,15 @@ public actor SQLiteMemoryStore: MemoryStore {
             sqlite3_free(errorMessage)
             throw MemoryStoreError.database(message)
         }
+    }
+
+    private static func errorDescription(_ error: Error) -> String {
+        if let localized = error as? LocalizedError,
+           let description = localized.errorDescription,
+           !description.isEmpty {
+            return description
+        }
+        return String(describing: error)
     }
 
     private static func scalarInt(_ database: OpaquePointer, sql: String) throws -> Int64 {

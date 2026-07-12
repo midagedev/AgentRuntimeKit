@@ -30,6 +30,23 @@ public protocol MemoryStore: Sendable {
         at date: Date
     ) async throws
 
+    /// Physically removes one record and its related store-owned artifacts.
+    /// The ID is acted on only when it belongs to the exact supplied scope.
+    func purge(id: UUID, scope: MemoryScope) async throws -> MemoryPurgeResult
+
+    /// Physically removes every record in the supplied exact scopes. Scopes are
+    /// never widened to child, parent, application, or neighboring user scopes.
+    func purge(scopes: [MemoryScope]) async throws -> MemoryPurgeResult
+
+    /// Lists every record explicitly owned by one app user, including expired,
+    /// rejected, deleted, and records from past session IDs. Application-wide
+    /// and scopes without this exact user ID are excluded.
+    func recordsOwned(appID: String, userID: String) async throws -> [MemoryRecord]
+
+    /// Physically removes all records returned by `recordsOwned`. It never
+    /// removes application-wide or user-unbound records.
+    func purgeOwned(appID: String, userID: String) async throws -> MemoryPurgeResult
+
     func retrieve(_ query: MemoryQuery) async throws -> MemoryRetrievalResult
 
     func events(
@@ -86,6 +103,30 @@ public extension MemoryStore {
         at date: Date = .now
     ) async throws {
         try await delete(id: id, scope: scope, expectedRevision: expectedRevision, at: date)
+    }
+
+    /// Preserves source compatibility for existing custom stores while failing
+    /// closed: a store must opt in with a real physical-purge implementation.
+    func purge(id: UUID, scope: MemoryScope) async throws -> MemoryPurgeResult {
+        throw MemoryStoreCapabilityError.privacyPurgeUnavailable
+    }
+
+    /// Preserves source compatibility for existing custom stores while failing
+    /// closed: a store must opt in with a real physical-purge implementation.
+    func purge(scopes: [MemoryScope]) async throws -> MemoryPurgeResult {
+        throw MemoryStoreCapabilityError.privacyPurgeUnavailable
+    }
+
+    /// Preserves source compatibility for existing custom stores while failing
+    /// closed instead of silently returning an incomplete owner inventory.
+    func recordsOwned(appID: String, userID: String) async throws -> [MemoryRecord] {
+        throw MemoryStoreCapabilityError.privacyPurgeUnavailable
+    }
+
+    /// Preserves source compatibility for existing custom stores while failing
+    /// closed: a store must opt in with a real physical-purge implementation.
+    func purgeOwned(appID: String, userID: String) async throws -> MemoryPurgeResult {
+        throw MemoryStoreCapabilityError.privacyPurgeUnavailable
     }
 
     func events(
@@ -250,6 +291,71 @@ public actor InMemoryMemoryStore: MemoryStore {
         )
     }
 
+    public func purge(id: UUID, scope: MemoryScope) async throws -> MemoryPurgeResult {
+        _ = try scope.validated()
+        guard let record = records[id], record.scope == scope else {
+            return MemoryPurgeResult()
+        }
+
+        records.removeValue(forKey: id)
+        dedupeIndex = dedupeIndex.filter { $0.value != id }
+        let eventCount = eventLog.count { $0.recordID == id }
+        eventLog.removeAll { $0.recordID == id }
+        return MemoryPurgeResult(recordsPurged: 1, eventsPurged: eventCount)
+    }
+
+    public func purge(scopes: [MemoryScope]) async throws -> MemoryPurgeResult {
+        let exactScopes = Set(try scopes.map { try $0.validated() })
+        guard !exactScopes.isEmpty else { return MemoryPurgeResult() }
+
+        let recordIDs = Set(records.values.lazy
+            .filter { exactScopes.contains($0.scope) }
+            .map(\.id))
+        let eventCount = eventLog.count {
+            recordIDs.contains($0.recordID) || exactScopes.contains($0.scope)
+        }
+        records = records.filter { !recordIDs.contains($0.key) }
+        dedupeIndex = dedupeIndex.filter { !recordIDs.contains($0.value) }
+        eventLog.removeAll {
+            recordIDs.contains($0.recordID) || exactScopes.contains($0.scope)
+        }
+        return MemoryPurgeResult(
+            recordsPurged: recordIDs.count,
+            eventsPurged: eventCount
+        )
+    }
+
+    public func recordsOwned(appID: String, userID: String) async throws -> [MemoryRecord] {
+        _ = try MemoryScope.user(appID: appID, userID: userID).validated()
+        return records.values
+            .filter { Self.isOwned($0.scope, appID: appID, userID: userID) }
+            .sorted {
+                if $0.updatedAt != $1.updatedAt { return $0.updatedAt > $1.updatedAt }
+                return $0.id.uuidString < $1.id.uuidString
+            }
+    }
+
+    public func purgeOwned(appID: String, userID: String) async throws -> MemoryPurgeResult {
+        _ = try MemoryScope.user(appID: appID, userID: userID).validated()
+        let recordIDs = Set(records.values.lazy
+            .filter { Self.isOwned($0.scope, appID: appID, userID: userID) }
+            .map(\.id))
+        let eventCount = eventLog.count {
+            recordIDs.contains($0.recordID)
+                || Self.isOwned($0.scope, appID: appID, userID: userID)
+        }
+        records = records.filter { !recordIDs.contains($0.key) }
+        dedupeIndex = dedupeIndex.filter { !recordIDs.contains($0.value) }
+        eventLog.removeAll {
+            recordIDs.contains($0.recordID)
+                || Self.isOwned($0.scope, appID: appID, userID: userID)
+        }
+        return MemoryPurgeResult(
+            recordsPurged: recordIDs.count,
+            eventsPurged: eventCount
+        )
+    }
+
     public func retrieve(_ query: MemoryQuery) throws -> MemoryRetrievalResult {
         try MemoryRetrievalEngine.validate(query)
         let visibleScopes = Set(query.scopes)
@@ -304,6 +410,19 @@ public actor InMemoryMemoryStore: MemoryStore {
                 "sensitivity": .string(record.sensitivity.rawValue),
             ]
         ))
+    }
+
+    private static func isOwned(
+        _ scope: MemoryScope,
+        appID: String,
+        userID: String
+    ) -> Bool {
+        switch scope.level {
+        case .application:
+            false
+        case .user, .agent, .workspace, .session:
+            scope.appID == appID && scope.userID == userID
+        }
     }
 
     private static func matches(
