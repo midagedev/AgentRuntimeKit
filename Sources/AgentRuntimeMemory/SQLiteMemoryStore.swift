@@ -10,6 +10,23 @@ public struct SQLiteMemoryStoreDiagnostics: Sendable, Hashable {
     public var secureDeleteEnabled: Bool
 }
 
+/// One non-canonical scope found in a pre-0.2 SQLite database.
+///
+/// AgentRuntimeKit 0.2 rejects these identities for new writes. This summary is
+/// exposed only for an explicit host migration or privacy-erasure flow; it does
+/// not broaden ordinary retrieval. Counts contain no memory content.
+public struct SQLiteLegacyScopeSummary: Sendable, Codable, Hashable {
+    public let scope: MemoryScope
+    public let recordCount: Int
+    public let eventCount: Int
+
+    public init(scope: MemoryScope, recordCount: Int, eventCount: Int) {
+        self.scope = scope
+        self.recordCount = recordCount
+        self.eventCount = eventCount
+    }
+}
+
 struct SQLiteMemoryArtifactCounts: Sendable, Equatable {
     var records: Int
     var events: Int
@@ -19,7 +36,7 @@ struct SQLiteMemoryArtifactCounts: Sendable, Equatable {
 /// Durable, process-safe memory storage. One actor serializes access through a
 /// full-mutex SQLite connection while WAL and a busy timeout coordinate other
 /// processes opening the same database.
-public actor SQLiteMemoryStore: MemoryStore {
+public actor SQLiteMemoryStore: MemoryStore, MemorySourceReconciliationStore {
     private final class Connection: @unchecked Sendable {
         var pointer: OpaquePointer?
 
@@ -40,13 +57,18 @@ public actor SQLiteMemoryStore: MemoryStore {
         case null
     }
 
-    private static let currentSchemaVersion = 2
+    private static let currentSchemaVersion = 5
     private static let exactScopePredicate = """
         scope_level = ? AND app_id = ? AND user_id = ?
         AND agent_id = ? AND workspace_id = ? AND session_id = ?
         """
     private static let ownedPredicate = """
         scope_level IN (?, ?, ?, ?) AND app_id = ? AND user_id = ?
+        """
+    private static let sourceIdentityPredicate = """
+        source_identifier = ? AND source_scope_level = ? AND source_app_id = ?
+        AND source_user_id = ? AND source_agent_id = ?
+        AND source_workspace_id = ? AND source_session_id = ?
         """
     private static let createEventDeleteGuardSQL = """
         CREATE TRIGGER memory_events_are_append_only_on_delete
@@ -262,7 +284,7 @@ public actor SQLiteMemoryStore: MemoryStore {
         includeExpired: Bool,
         at date: Date
     ) throws -> MemoryRecord? {
-        _ = try scope.validated()
+        let scope = try scope.validatedForLegacySQLiteAccess()
         let database = try openDatabase()
         guard let record = try find(database, id: id, scope: scope) else { return nil }
         guard includeExpired || !record.isExpired(at: date) else { return nil }
@@ -276,7 +298,7 @@ public actor SQLiteMemoryStore: MemoryStore {
         expectedRevision: Int,
         at date: Date
     ) throws -> MemoryRecord {
-        _ = try scope.validated()
+        let scope = try scope.validatedForLegacySQLiteAccess()
         return try transaction {
             let database = try openDatabase()
             guard var record = try find(database, id: id, scope: scope) else {
@@ -324,7 +346,7 @@ public actor SQLiteMemoryStore: MemoryStore {
     }
 
     public func purge(id: UUID, scope: MemoryScope) async throws -> MemoryPurgeResult {
-        let scope = try scope.validated()
+        let scope = try scope.validatedForLegacySQLiteAccess()
         let result = try transaction {
             let database = try openDatabase()
             guard try find(database, id: id, scope: scope) != nil else {
@@ -340,23 +362,31 @@ public actor SQLiteMemoryStore: MemoryStore {
                 try rebuildFullTextIndex(database)
             }
             try restoreEventDeletionGuard(database)
+            if result.didPurgeAnything {
+                try schedulePhysicalPurgeCleanup(database)
+            }
             return result
         }
-        // A retry after an interrupted cleanup is intentionally useful even
-        // when the record was already gone: it can finish compaction and WAL
-        // truncation.
-        return try finishPhysicalPurge(result)
+        // A durable cleanup epoch makes an idempotent retry useful after an
+        // interrupted cleanup without imposing VACUUM on ordinary no-ops.
+        return try finishPhysicalPurgeIfNeeded(result)
     }
 
     public func purge(scopes: [MemoryScope]) async throws -> MemoryPurgeResult {
-        let validated = try scopes.map { try $0.validated() }
-        let exactScopes = Array(Set(validated))
+        // Do not place legacy scopes in a Swift `Set`: `String` equality uses
+        // canonical Unicode equivalence while SQLite scope identity preserves
+        // exact UTF-8 bytes. Processing an exact duplicate twice is harmless
+        // and keeps canonically equivalent legacy namespaces distinct.
+        let exactScopes = try scopes.map {
+            try $0.validatedForLegacySQLiteAccess()
+        }
         guard !exactScopes.isEmpty else { return MemoryPurgeResult() }
 
         let result = try transaction {
             let database = try openDatabase()
             try removeEventDeletionGuard(database)
             var aggregate = MemoryPurgeResult()
+            var deletedSourceStates = 0
             for scope in exactScopes {
                 let partial = try purgeRecords(
                     database,
@@ -366,14 +396,22 @@ public actor SQLiteMemoryStore: MemoryStore {
                 aggregate.recordsPurged += partial.recordsPurged
                 aggregate.eventsPurged += partial.eventsPurged
                 aggregate.fullTextEntriesPurged += partial.fullTextEntriesPurged
+                deletedSourceStates += try executePreparedChanges(
+                    database,
+                    sql: "DELETE FROM memory_sources WHERE \(Self.exactScopePredicate)",
+                    bindings: scopeBindings(scope)
+                )
             }
             if aggregate.recordsPurged > 0, try fullTextSearchTableExists(database) {
                 try rebuildFullTextIndex(database)
             }
             try restoreEventDeletionGuard(database)
+            if aggregate.didPurgeAnything || deletedSourceStates > 0 {
+                try schedulePhysicalPurgeCleanup(database)
+            }
             return aggregate
         }
-        return try finishPhysicalPurge(result)
+        return try finishPhysicalPurgeIfNeeded(result)
     }
 
     public func recordsOwned(appID: String, userID: String) async throws -> [MemoryRecord] {
@@ -401,17 +439,410 @@ public actor SQLiteMemoryStore: MemoryStore {
                 where: Self.ownedPredicate,
                 bindings: bindings
             )
+            let deletedSourceStates = try executePreparedChanges(
+                database,
+                sql: "DELETE FROM memory_sources WHERE \(Self.ownedPredicate)",
+                bindings: bindings
+            )
             if result.recordsPurged > 0, try fullTextSearchTableExists(database) {
                 try rebuildFullTextIndex(database)
             }
             try restoreEventDeletionGuard(database)
+            if result.didPurgeAnything || deletedSourceStates > 0 {
+                try schedulePhysicalPurgeCleanup(database)
+            }
             return result
         }
-        return try finishPhysicalPurge(result)
+        return try finishPhysicalPurgeIfNeeded(result)
+    }
+
+    /// Lists persisted scopes that fail current canonical validation.
+    ///
+    /// This is an administrative migration surface for databases written by
+    /// AgentRuntimeKit 0.1.x. Callers should present or log only aggregate
+    /// counts, never raw identifiers, unless their own privacy UI requires it.
+    /// Ordinary read and purge methods remain exact-scope and reject lossy NUL
+    /// or empty-optional aliases.
+    public func legacyScopeInventory() throws -> [SQLiteLegacyScopeSummary] {
+        let database = try openDatabase()
+        let statement = try prepare(
+            database,
+            sql: """
+                SELECT
+                    r.scope_level, r.app_id, r.user_id, r.agent_id,
+                    r.workspace_id, r.session_id, COUNT(*),
+                    (
+                        SELECT COUNT(*) FROM memory_events e
+                        WHERE e.scope_level = r.scope_level
+                          AND e.app_id = r.app_id AND e.user_id = r.user_id
+                          AND e.agent_id = r.agent_id
+                          AND e.workspace_id = r.workspace_id
+                          AND e.session_id = r.session_id
+                    )
+                FROM memory_records r
+                GROUP BY
+                    r.scope_level, r.app_id, r.user_id, r.agent_id,
+                    r.workspace_id, r.session_id
+                ORDER BY
+                    r.scope_level, r.app_id, r.user_id, r.agent_id,
+                    r.workspace_id, r.session_id
+                """,
+            bindings: []
+        )
+        defer { sqlite3_finalize(statement) }
+        var result: [SQLiteLegacyScopeSummary] = []
+        while true {
+            switch sqlite3_step(statement) {
+            case SQLITE_ROW:
+                guard let level = MemoryScopeLevel(rawValue: try Self.text(statement, 0)) else {
+                    throw MemoryStoreError.serialization(
+                        "a legacy scope row contains an unknown scope level"
+                    )
+                }
+                let scope = MemoryScope(
+                    level: level,
+                    appID: try Self.text(statement, 1),
+                    userID: try Self.optionalIdentifier(statement, 2),
+                    agentID: try Self.optionalIdentifier(statement, 3),
+                    workspaceID: try Self.optionalIdentifier(statement, 4),
+                    sessionID: try Self.optionalIdentifier(statement, 5)
+                )
+                guard (try? scope.validated()) == nil else { continue }
+                result.append(SQLiteLegacyScopeSummary(
+                    scope: scope,
+                    recordCount: Int(sqlite3_column_int64(statement, 6)),
+                    eventCount: Int(sqlite3_column_int64(statement, 7))
+                ))
+            case SQLITE_DONE:
+                return result
+            default:
+                throw Self.error(from: database)
+            }
+        }
+    }
+
+    /// Purges one exact non-canonical persisted scope returned by
+    /// ``legacyScopeInventory()``.
+    ///
+    /// This deliberately does not reinterpret NUL-terminated 0.1.x input. That
+    /// historical binding discarded the suffix and cannot distinguish it from
+    /// a legitimate prefix namespace. Hosts must select the exact persisted
+    /// scope from the inventory. A canonical scope must use the ordinary purge
+    /// APIs instead.
+    public func purgeLegacyPersistedScope(
+        _ persistedScope: MemoryScope
+    ) async throws -> MemoryPurgeResult {
+        guard [
+            persistedScope.userID,
+            persistedScope.agentID,
+            persistedScope.workspaceID,
+            persistedScope.sessionID,
+        ].allSatisfy({ $0 != "" }) else {
+            throw MemoryStoreError.invalidScope(
+                "legacy purge selectors must use nil, not a present empty optional identifier"
+            )
+        }
+        guard (try? persistedScope.validated()) == nil else {
+            throw MemoryStoreError.invalidScope(
+                "canonical scopes must use the ordinary purge API"
+            )
+        }
+
+        let result = try transaction {
+            let database = try openDatabase()
+            try removeEventDeletionGuard(database)
+            let result = try purgeRecords(
+                database,
+                where: Self.exactScopePredicate,
+                bindings: scopeBindings(persistedScope)
+            )
+            let deletedSourceStates = try executePreparedChanges(
+                database,
+                sql: "DELETE FROM memory_sources WHERE \(Self.exactScopePredicate)",
+                bindings: scopeBindings(persistedScope)
+            )
+            if result.recordsPurged > 0, try fullTextSearchTableExists(database) {
+                try rebuildFullTextIndex(database)
+            }
+            try restoreEventDeletionGuard(database)
+            if result.didPurgeAnything || deletedSourceStates > 0 {
+                try schedulePhysicalPurgeCleanup(database)
+            }
+            return result
+        }
+        return try finishPhysicalPurgeIfNeeded(result)
+    }
+
+    public func sourceState(
+        identifier: String,
+        scope: MemoryScope
+    ) throws -> MemorySourceState? {
+        let identity = try MemorySourceReconciliationValidation.identity(
+            identifier: identifier,
+            scope: scope
+        )
+        let database = try openDatabase()
+        let statement = try prepare(
+            database,
+            sql: """
+                SELECT generation FROM memory_sources
+                WHERE identifier = ? AND \(Self.exactScopePredicate)
+                """,
+            bindings: sourceBindings(identity)
+        )
+        defer { sqlite3_finalize(statement) }
+        switch sqlite3_step(statement) {
+        case SQLITE_ROW:
+            return MemorySourceState(
+                identifier: identity.identifier,
+                scope: identity.scope,
+                generation: Int(sqlite3_column_int64(statement, 0))
+            )
+        case SQLITE_DONE:
+            return nil
+        default:
+            throw Self.error(from: database)
+        }
+    }
+
+    public func reconcileSourceSnapshot(
+        _ snapshot: MemorySourceSnapshot,
+        expectedGeneration: Int,
+        missingPolicy: MemorySourceMissingPolicy,
+        at date: Date
+    ) throws -> MemorySourceReconciliationReport {
+        // Perform all caller-controlled validation before BEGIN IMMEDIATE so a
+        // malformed item near the end of a large snapshot cannot mutate state.
+        let snapshot = try MemorySourceReconciliationValidation.snapshot(
+            snapshot,
+            expectedGeneration: expectedGeneration,
+            at: date
+        )
+        let result: (MemorySourceReconciliationReport, MemoryPurgeResult) = try transaction {
+            let database = try openDatabase()
+            let currentGeneration = try sourceGeneration(database, identity: snapshot.identity)
+                ?? 0
+            guard currentGeneration == snapshot.expectedGeneration else {
+                throw MemorySourceReconciliationError.generationConflict(
+                    expected: snapshot.expectedGeneration,
+                    actual: currentGeneration
+                )
+            }
+            let nextGeneration = try MemorySourceReconciliationValidation.nextGeneration(
+                after: currentGeneration
+            )
+            let sourceExisted = try sourceGeneration(
+                database,
+                identity: snapshot.identity
+            ) != nil
+            if !sourceExisted {
+                try insertSource(
+                    database,
+                    identity: snapshot.identity,
+                    generation: currentGeneration
+                )
+            }
+
+            let mappings = try sourceMappings(database, identity: snapshot.identity)
+            let desiredDedupeKeyByMappedID = Dictionary(
+                uniqueKeysWithValues: snapshot.records.compactMap { item in
+                    mappings[item.sourceRecordID].map { ($0, item.deduplicationKey) }
+                }
+            )
+            var report = MemorySourceReconciliationReport(
+                identifier: snapshot.identity.identifier,
+                scope: snapshot.identity.scope,
+                previousGeneration: currentGeneration,
+                generation: nextGeneration
+            )
+
+            // Preflight every collision and mapped record before writing. The
+            // transaction itself remains the final cross-process authority.
+            for item in snapshot.records {
+                let mappedID = mappings[item.sourceRecordID]
+                if let mappedID {
+                    guard try find(
+                        database,
+                        id: mappedID,
+                        scope: snapshot.identity.scope
+                    ) != nil else {
+                        throw MemorySourceReconciliationError.corruptMapping(
+                            "a source entry points to a missing record or a different scope"
+                        )
+                    }
+                    if let owner = try sourceOwner(database, recordID: mappedID),
+                       owner != snapshot.identity {
+                        throw MemorySourceReconciliationError.recordOwnershipConflict(mappedID)
+                    }
+                }
+                if let existing = try findByDedupeKey(
+                    database,
+                    scope: snapshot.identity.scope,
+                    key: item.deduplicationKey
+                ), existing.id != mappedID {
+                    guard let desiredKey = desiredDedupeKeyByMappedID[existing.id],
+                          desiredKey != item.deduplicationKey else {
+                        throw MemorySourceReconciliationError.recordOwnershipConflict(existing.id)
+                    }
+                }
+            }
+
+            // SQLite enforces the exact-scope deduplication identity with a
+            // UNIQUE constraint. Move changing, source-owned keys to private
+            // transaction-local sentinels first so swaps and longer cycles do
+            // not depend on input order. Rollback restores every original key.
+            for (id, desiredKey) in desiredDedupeKeyByMappedID {
+                guard let record = try find(
+                    database,
+                    id: id,
+                    scope: snapshot.identity.scope
+                ) else {
+                    throw MemorySourceReconciliationError.corruptMapping(
+                        "a mapped record disappeared before key staging"
+                    )
+                }
+                guard record.deduplicationKey != desiredKey else { continue }
+                try stageTemporaryDeduplicationKey(
+                    database,
+                    recordID: id,
+                    scope: snapshot.identity.scope
+                )
+            }
+
+            let incomingIDs = Set(snapshot.records.map(\.sourceRecordID))
+            for item in snapshot.records {
+                if let id = mappings[item.sourceRecordID] {
+                    guard var record = try find(
+                        database,
+                        id: id,
+                        scope: snapshot.identity.scope
+                    ) else {
+                        throw MemorySourceReconciliationError.corruptMapping(
+                            "a mapped record disappeared during reconciliation"
+                        )
+                    }
+                    if Self.matches(record, proposal: item.proposal, status: .active, at: date) {
+                        report.unchanged += 1
+                        continue
+                    }
+                    let oldRevision = record.revision
+                    InMemoryMemoryStore.replace(
+                        &record,
+                        with: item.proposal,
+                        deduplicationKey: item.deduplicationKey,
+                        status: .active,
+                        at: date
+                    )
+                    try writeRecord(database, record: record, inserting: false)
+                    try synchronizeFullTextIndex(database, record: record)
+                    try insertEvent(
+                        database,
+                        record: record,
+                        kind: .updated,
+                        previousRevision: oldRevision,
+                        at: date
+                    )
+                    report.updated += 1
+                } else {
+                    let record = InMemoryMemoryStore.makeRecord(
+                        proposal: item.proposal,
+                        deduplicationKey: item.deduplicationKey,
+                        at: date
+                    )
+                    try writeRecord(database, record: record, inserting: true)
+                    try synchronizeFullTextIndex(database, record: record)
+                    try insertEvent(
+                        database,
+                        record: record,
+                        kind: .created,
+                        previousRevision: nil,
+                        at: date
+                    )
+                    try insertSourceMapping(
+                        database,
+                        identity: snapshot.identity,
+                        sourceRecordID: item.sourceRecordID,
+                        recordID: record.id
+                    )
+                    report.created += 1
+                }
+            }
+
+            let missing = mappings.filter { !incomingIDs.contains($0.key) }
+            var purgeResult = MemoryPurgeResult()
+            switch missingPolicy {
+            case .archive:
+                for (_, id) in missing {
+                    guard var record = try find(
+                        database,
+                        id: id,
+                        scope: snapshot.identity.scope
+                    ) else {
+                        throw MemorySourceReconciliationError.corruptMapping(
+                            "a missing source entry points to an absent memory record"
+                        )
+                    }
+                    if record.status == .archived {
+                        report.unchanged += 1
+                        continue
+                    }
+                    let oldRevision = record.revision
+                    record.status = .archived
+                    record.revision += 1
+                    record.updatedAt = date
+                    try writeRecord(database, record: record, inserting: false)
+                    try synchronizeFullTextIndex(database, record: record)
+                    try insertEvent(
+                        database,
+                        record: record,
+                        kind: .statusChanged,
+                        previousRevision: oldRevision,
+                        at: date
+                    )
+                    report.archived += 1
+                }
+            case .purge:
+                if !missing.isEmpty {
+                    try removeEventDeletionGuard(database)
+                    let partial = try purgeSourceRecordsBatch(
+                        database,
+                        recordIDs: missing.map(\.value),
+                        scope: snapshot.identity.scope
+                    )
+                    purgeResult = partial
+                    report.purged += partial.recordsPurged
+                    if partial.recordsPurged > 0,
+                       try fullTextSearchTableExists(database) {
+                        try rebuildFullTextIndex(database)
+                    }
+                    try restoreEventDeletionGuard(database)
+                    if partial.didPurgeAnything {
+                        try schedulePhysicalPurgeCleanup(database)
+                    }
+                }
+            }
+
+            try executePrepared(
+                database,
+                sql: """
+                    UPDATE memory_sources SET generation = ?
+                    WHERE identifier = ? AND \(Self.exactScopePredicate)
+                    """,
+                bindings: [.integer(Int64(nextGeneration))] + sourceBindings(snapshot.identity)
+            )
+            return (report, purgeResult)
+        }
+        // A no-op `.purge` reconciliation consults durable maintenance state.
+        // It retries cleanup after a committed failure, but otherwise avoids
+        // an unnecessary VACUUM and WAL checkpoint.
+        if missingPolicy == .purge {
+            _ = try finishPhysicalPurgeIfNeeded(result.1)
+        }
+        return result.0
     }
 
     public func retrieve(_ query: MemoryQuery) throws -> MemoryRetrievalResult {
-        try MemoryRetrievalEngine.validate(query)
+        try MemoryRetrievalEngine.validateForLegacySQLiteAccess(query)
         guard query.limit > 0, query.characterBudget > 0 else {
             return MemoryRetrievalResult(
                 hits: [],
@@ -460,7 +891,7 @@ public actor SQLiteMemoryStore: MemoryStore {
         recordID: UUID?,
         limit: Int
     ) throws -> [MemoryEvent] {
-        _ = try scope.validated()
+        let scope = try scope.validatedForLegacySQLiteAccess()
         let database = try openDatabase()
         var sql = """
             SELECT id, record_id, scope_level, app_id, user_id, agent_id,
@@ -604,6 +1035,112 @@ public actor SQLiteMemoryStore: MemoryStore {
                 throw error
             }
         }
+        if version < 3 {
+            try execute(database, sql: "BEGIN IMMEDIATE")
+            do {
+                try execute(database, sql: """
+                    CREATE TABLE memory_sources (
+                        identifier TEXT NOT NULL,
+                        scope_level TEXT NOT NULL,
+                        app_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL DEFAULT '',
+                        agent_id TEXT NOT NULL DEFAULT '',
+                        workspace_id TEXT NOT NULL DEFAULT '',
+                        session_id TEXT NOT NULL DEFAULT '',
+                        generation INTEGER NOT NULL CHECK(generation >= 0),
+                        PRIMARY KEY(
+                            identifier, scope_level, app_id, user_id, agent_id,
+                            workspace_id, session_id
+                        )
+                    );
+
+                    CREATE INDEX memory_sources_scope_lookup
+                    ON memory_sources(
+                        scope_level, app_id, user_id, agent_id,
+                        workspace_id, session_id
+                    );
+
+                    CREATE TABLE memory_source_records (
+                        source_identifier TEXT NOT NULL,
+                        source_scope_level TEXT NOT NULL,
+                        source_app_id TEXT NOT NULL,
+                        source_user_id TEXT NOT NULL DEFAULT '',
+                        source_agent_id TEXT NOT NULL DEFAULT '',
+                        source_workspace_id TEXT NOT NULL DEFAULT '',
+                        source_session_id TEXT NOT NULL DEFAULT '',
+                        source_record_id TEXT NOT NULL,
+                        record_id TEXT NOT NULL UNIQUE
+                            REFERENCES memory_records(id) ON DELETE CASCADE,
+                        PRIMARY KEY(
+                            source_identifier, source_scope_level, source_app_id,
+                            source_user_id, source_agent_id, source_workspace_id,
+                            source_session_id, source_record_id
+                        ),
+                        FOREIGN KEY(
+                            source_identifier, source_scope_level, source_app_id,
+                            source_user_id, source_agent_id, source_workspace_id,
+                            source_session_id
+                        ) REFERENCES memory_sources(
+                            identifier, scope_level, app_id, user_id, agent_id,
+                            workspace_id, session_id
+                        ) ON DELETE CASCADE
+                    );
+
+                    PRAGMA user_version = 3;
+                    """)
+                try execute(database, sql: "COMMIT")
+            } catch {
+                try? execute(database, sql: "ROLLBACK")
+                throw error
+            }
+        }
+        if version < 4 {
+            // Databases created by a previous library version may have had a
+            // logical purge commit immediately before physical cleanup failed.
+            // Conservatively leave one cleanup pending for upgraded stores;
+            // brand-new databases have no historical cleanup to recover.
+            let initialCleanupEpoch = version == 0 ? 0 : 1
+            try execute(database, sql: "BEGIN IMMEDIATE")
+            do {
+                try execute(database, sql: """
+                    CREATE TABLE memory_store_maintenance (
+                        singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton = 1),
+                        purge_cleanup_epoch INTEGER NOT NULL
+                            CHECK(purge_cleanup_epoch >= 0),
+                        completed_purge_cleanup_epoch INTEGER NOT NULL
+                            CHECK(
+                                completed_purge_cleanup_epoch >= 0
+                                AND completed_purge_cleanup_epoch <= purge_cleanup_epoch
+                            )
+                    );
+
+                    INSERT INTO memory_store_maintenance (
+                        singleton, purge_cleanup_epoch, completed_purge_cleanup_epoch
+                    ) VALUES (1, \(initialCleanupEpoch), 0);
+
+                    PRAGMA user_version = 4;
+                    """)
+                try execute(database, sql: "COMMIT")
+            } catch {
+                try? execute(database, sql: "ROLLBACK")
+                throw error
+            }
+        }
+        if version < 5 {
+            try execute(database, sql: "BEGIN IMMEDIATE")
+            do {
+                try execute(database, sql: """
+                    CREATE INDEX memory_events_record_lookup
+                    ON memory_events(record_id);
+
+                    PRAGMA user_version = 5;
+                    """)
+                try execute(database, sql: "COMMIT")
+            } catch {
+                try? execute(database, sql: "ROLLBACK")
+                throw error
+            }
+        }
     }
 
     private static func configureFullTextSearch(_ database: OpaquePointer) -> Bool {
@@ -659,6 +1196,102 @@ public actor SQLiteMemoryStore: MemoryStore {
         )
     }
 
+    private func purgeSourceRecordsBatch(
+        _ database: OpaquePointer,
+        recordIDs: [UUID],
+        scope: MemoryScope
+    ) throws -> MemoryPurgeResult {
+        let uniqueIDs = Set(recordIDs)
+        guard uniqueIDs.count == recordIDs.count else {
+            throw MemorySourceReconciliationError.corruptMapping(
+                "multiple source entries point to the same memory record"
+            )
+        }
+
+        try Self.execute(database, sql: """
+            CREATE TEMP TABLE IF NOT EXISTS agentruntime_source_purge_ids (
+                id TEXT PRIMARY KEY NOT NULL
+            ) WITHOUT ROWID
+            """)
+        try Self.execute(
+            database,
+            sql: "DELETE FROM agentruntime_source_purge_ids"
+        )
+
+        let sortedIDs = uniqueIDs.map(\.uuidString).sorted()
+        let batchSize = 256
+        var start = 0
+        while start < sortedIDs.count {
+            let end = min(start + batchSize, sortedIDs.count)
+            let batch = sortedIDs[start..<end]
+            let placeholders = Array(repeating: "(?)", count: batch.count)
+                .joined(separator: ",")
+            try executePrepared(
+                database,
+                sql: "INSERT INTO agentruntime_source_purge_ids(id) VALUES \(placeholders)",
+                bindings: batch.map(Binding.text)
+            )
+            start = end
+        }
+
+        let matchedRecordCount = try scalarInt(
+            database,
+            sql: """
+                SELECT COUNT(*) FROM memory_records
+                WHERE id IN (SELECT id FROM agentruntime_source_purge_ids)
+                  AND \(Self.exactScopePredicate)
+                """,
+            bindings: scopeBindings(scope)
+        )
+        guard matchedRecordCount == sortedIDs.count else {
+            throw MemorySourceReconciliationError.corruptMapping(
+                "a missing source entry points to an absent record or a different scope"
+            )
+        }
+
+        let fullTextEntries = try fullTextSearchTableExists(database)
+            ? try executePreparedChanges(
+                database,
+                sql: """
+                    DELETE FROM memory_records_fts
+                    WHERE record_id IN (SELECT id FROM agentruntime_source_purge_ids)
+                    """,
+                bindings: []
+            )
+            : 0
+        let events = try executePreparedChanges(
+            database,
+            sql: """
+                DELETE FROM memory_events
+                WHERE record_id IN (SELECT id FROM agentruntime_source_purge_ids)
+                """,
+            bindings: []
+        )
+        let records = try executePreparedChanges(
+            database,
+            sql: """
+                DELETE FROM memory_records
+                WHERE id IN (SELECT id FROM agentruntime_source_purge_ids)
+                  AND \(Self.exactScopePredicate)
+                """,
+            bindings: scopeBindings(scope)
+        )
+        guard records == sortedIDs.count else {
+            throw MemorySourceReconciliationError.corruptMapping(
+                "the batch source purge did not remove every mapped record"
+            )
+        }
+        try Self.execute(
+            database,
+            sql: "DELETE FROM agentruntime_source_purge_ids"
+        )
+        return MemoryPurgeResult(
+            recordsPurged: records,
+            eventsPurged: events,
+            fullTextEntriesPurged: fullTextEntries
+        )
+    }
+
     private func rebuildFullTextIndex(_ database: OpaquePointer) throws {
         // FTS5 normally retains old term segments until they are merged. A
         // privacy purge therefore rebuilds the virtual table from the remaining
@@ -684,10 +1317,74 @@ public actor SQLiteMemoryStore: MemoryStore {
         ) == 1
     }
 
-    private func finishPhysicalPurge(
+    private func schedulePhysicalPurgeCleanup(_ database: OpaquePointer) throws {
+        let changed = try executePreparedChanges(
+            database,
+            sql: """
+                UPDATE memory_store_maintenance
+                SET purge_cleanup_epoch = purge_cleanup_epoch + 1
+                WHERE singleton = 1 AND purge_cleanup_epoch < ?
+                """,
+            bindings: [.integer(Int64.max)]
+        )
+        guard changed == 1 else {
+            throw MemoryStoreError.database(
+                "physical purge cleanup state is missing or exhausted"
+            )
+        }
+    }
+
+    private func physicalPurgeCleanupState(
+        _ database: OpaquePointer
+    ) throws -> (scheduled: Int64, completed: Int64) {
+        let statement = try prepare(
+            database,
+            sql: """
+                SELECT purge_cleanup_epoch, completed_purge_cleanup_epoch
+                FROM memory_store_maintenance WHERE singleton = 1
+                """,
+            bindings: []
+        )
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw MemoryStoreError.database("physical purge cleanup state is missing")
+        }
+        return (
+            scheduled: sqlite3_column_int64(statement, 0),
+            completed: sqlite3_column_int64(statement, 1)
+        )
+    }
+
+    private func markPhysicalPurgeCleanupCompleted(through epoch: Int64) throws {
+        try transaction {
+            let database = try openDatabase()
+            let changed = try executePreparedChanges(
+                database,
+                sql: """
+                    UPDATE memory_store_maintenance
+                    SET completed_purge_cleanup_epoch = MAX(
+                        completed_purge_cleanup_epoch, ?
+                    )
+                    WHERE singleton = 1 AND purge_cleanup_epoch >= ?
+                    """,
+                bindings: [.integer(epoch), .integer(epoch)]
+            )
+            guard changed == 1 else {
+                throw MemoryStoreError.database(
+                    "physical purge cleanup completion could not be persisted"
+                )
+            }
+        }
+    }
+
+    private func finishPhysicalPurgeIfNeeded(
         _ committedResult: MemoryPurgeResult
     ) throws -> MemoryPurgeResult {
         let database = try openDatabase()
+        let cleanup = try physicalPurgeCleanupState(database)
+        guard cleanup.scheduled > cleanup.completed else {
+            return committedResult
+        }
 
         // SQLite explicitly does not guarantee that core secure_delete scrubs
         // FTS5 shadow tables. Rebuilding removes logical terms in the atomic
@@ -710,6 +1407,20 @@ public actor SQLiteMemoryStore: MemoryStore {
                 committedResult: committedResult,
                 stage: .writeAheadLogTruncation,
                 underlyingDescription: Self.errorDescription(error)
+            )
+        }
+
+        do {
+            try markPhysicalPurgeCleanupCompleted(through: cleanup.scheduled)
+        } catch {
+            throw MemoryPurgeCleanupError(
+                committedResult: committedResult,
+                // Keep the existing public two-stage error surface. Durable
+                // maintenance state is the final WAL-cleanup checkpoint, and
+                // its detailed cause remains available to callers here.
+                stage: .writeAheadLogTruncation,
+                underlyingDescription: "Maintenance-state persistence failed: "
+                    + Self.errorDescription(error)
             )
         }
         return committedResult
@@ -764,6 +1475,34 @@ public actor SQLiteMemoryStore: MemoryStore {
         )
     }
 
+    private func stageTemporaryDeduplicationKey(
+        _ database: OpaquePointer,
+        recordID: UUID,
+        scope: MemoryScope
+    ) throws {
+        let temporaryKey: String
+        while true {
+            // Valid proposals resolve to lowercase SHA-256 values. The prefix
+            // also protects imported legacy rows, and the lookup makes the
+            // uniqueness argument authoritative rather than probabilistic.
+            let candidate = "agent-runtime-temporary:\(UUID().uuidString)"
+            if try findByDedupeKey(database, scope: scope, key: candidate) == nil {
+                temporaryKey = candidate
+                break
+            }
+        }
+        let changed = try executePreparedChanges(
+            database,
+            sql: "UPDATE memory_records SET deduplication_key = ? WHERE id = ?",
+            bindings: [.text(temporaryKey), .text(recordID.uuidString)]
+        )
+        guard changed == 1 else {
+            throw MemorySourceReconciliationError.corruptMapping(
+                "a mapped record could not be staged for a deduplication-key update"
+            )
+        }
+    }
+
     private func find(
         _ database: OpaquePointer,
         id: UUID,
@@ -779,6 +1518,145 @@ public actor SQLiteMemoryStore: MemoryStore {
             database,
             sql: sql,
             bindings: [.text(id.uuidString)] + scopeBindings(scope)
+        )
+    }
+
+    private func sourceGeneration(
+        _ database: OpaquePointer,
+        identity: MemorySourceIdentity
+    ) throws -> Int? {
+        let statement = try prepare(
+            database,
+            sql: """
+                SELECT generation FROM memory_sources
+                WHERE identifier = ? AND \(Self.exactScopePredicate)
+                """,
+            bindings: sourceBindings(identity)
+        )
+        defer { sqlite3_finalize(statement) }
+        switch sqlite3_step(statement) {
+        case SQLITE_ROW:
+            return Int(sqlite3_column_int64(statement, 0))
+        case SQLITE_DONE:
+            return nil
+        default:
+            throw Self.error(from: database)
+        }
+    }
+
+    private func insertSource(
+        _ database: OpaquePointer,
+        identity: MemorySourceIdentity,
+        generation: Int
+    ) throws {
+        try executePrepared(
+            database,
+            sql: """
+                INSERT INTO memory_sources (
+                    identifier, scope_level, app_id, user_id, agent_id,
+                    workspace_id, session_id, generation
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+            bindings: sourceBindings(identity) + [.integer(Int64(generation))]
+        )
+    }
+
+    private func sourceMappings(
+        _ database: OpaquePointer,
+        identity: MemorySourceIdentity
+    ) throws -> [String: UUID] {
+        let statement = try prepare(
+            database,
+            sql: """
+                SELECT source_record_id, record_id FROM memory_source_records
+                WHERE \(Self.sourceIdentityPredicate)
+                ORDER BY source_record_id
+                """,
+            bindings: sourceMappingBindings(identity)
+        )
+        defer { sqlite3_finalize(statement) }
+        var result: [String: UUID] = [:]
+        while true {
+            switch sqlite3_step(statement) {
+            case SQLITE_ROW:
+                let sourceRecordID = try Self.text(statement, 0)
+                guard let recordID = UUID(uuidString: try Self.text(statement, 1)) else {
+                    throw MemorySourceReconciliationError.corruptMapping(
+                        "a mapped record ID is not a UUID"
+                    )
+                }
+                guard result.updateValue(recordID, forKey: sourceRecordID) == nil else {
+                    throw MemorySourceReconciliationError.corruptMapping(
+                        "one source record ID has duplicate mappings"
+                    )
+                }
+            case SQLITE_DONE:
+                return result
+            default:
+                throw Self.error(from: database)
+            }
+        }
+    }
+
+    private func sourceOwner(
+        _ database: OpaquePointer,
+        recordID: UUID
+    ) throws -> MemorySourceIdentity? {
+        let statement = try prepare(
+            database,
+            sql: """
+                SELECT source_identifier, source_scope_level, source_app_id,
+                       source_user_id, source_agent_id, source_workspace_id,
+                       source_session_id
+                FROM memory_source_records WHERE record_id = ?
+                """,
+            bindings: [.text(recordID.uuidString)]
+        )
+        defer { sqlite3_finalize(statement) }
+        switch sqlite3_step(statement) {
+        case SQLITE_ROW:
+            guard let level = MemoryScopeLevel(rawValue: try Self.text(statement, 1)) else {
+                throw MemorySourceReconciliationError.corruptMapping(
+                    "a mapped source scope has an unknown level"
+                )
+            }
+            return MemorySourceIdentity(
+                identifier: try Self.text(statement, 0),
+                scope: MemoryScope(
+                    level: level,
+                    appID: try Self.text(statement, 2),
+                    userID: try Self.optionalIdentifier(statement, 3),
+                    agentID: try Self.optionalIdentifier(statement, 4),
+                    workspaceID: try Self.optionalIdentifier(statement, 5),
+                    sessionID: try Self.optionalIdentifier(statement, 6)
+                )
+            )
+        case SQLITE_DONE:
+            return nil
+        default:
+            throw Self.error(from: database)
+        }
+    }
+
+    private func insertSourceMapping(
+        _ database: OpaquePointer,
+        identity: MemorySourceIdentity,
+        sourceRecordID: String,
+        recordID: UUID
+    ) throws {
+        try executePrepared(
+            database,
+            sql: """
+                INSERT INTO memory_source_records (
+                    source_identifier, source_scope_level, source_app_id,
+                    source_user_id, source_agent_id, source_workspace_id,
+                    source_session_id, source_record_id, record_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+            bindings: sourceMappingBindings(identity) + [
+                .text(sourceRecordID),
+                .text(recordID.uuidString),
+            ]
         )
     }
 
@@ -1020,27 +1898,27 @@ public actor SQLiteMemoryStore: MemoryStore {
 
     private func decodeRecord(_ statement: OpaquePointer) throws -> MemoryRecord {
         guard
-            let id = UUID(uuidString: Self.text(statement, 0)),
-            let level = MemoryScopeLevel(rawValue: Self.text(statement, 1)),
-            let kind = MemoryKind(rawValue: Self.text(statement, 7)),
-            let sensitivity = AgentDataSensitivity(rawValue: Self.text(statement, 9)),
-            let status = MemoryStatus(rawValue: Self.text(statement, 15))
+            let id = UUID(uuidString: try Self.text(statement, 0)),
+            let level = MemoryScopeLevel(rawValue: try Self.text(statement, 1)),
+            let kind = MemoryKind(rawValue: try Self.text(statement, 7)),
+            let sensitivity = AgentDataSensitivity(rawValue: try Self.text(statement, 9)),
+            let status = MemoryStatus(rawValue: try Self.text(statement, 15))
         else {
             throw MemoryStoreError.serialization("a memory row contains an unknown enum or UUID")
         }
         let scope = MemoryScope(
             level: level,
-            appID: Self.text(statement, 2),
-            userID: Self.optionalIdentifier(statement, 3),
-            agentID: Self.optionalIdentifier(statement, 4),
-            workspaceID: Self.optionalIdentifier(statement, 5),
-            sessionID: Self.optionalIdentifier(statement, 6)
+            appID: try Self.text(statement, 2),
+            userID: try Self.optionalIdentifier(statement, 3),
+            agentID: try Self.optionalIdentifier(statement, 4),
+            workspaceID: try Self.optionalIdentifier(statement, 5),
+            sessionID: try Self.optionalIdentifier(statement, 6)
         )
         return MemoryRecord(
             id: id,
             scope: scope,
             kind: kind,
-            content: Self.text(statement, 8),
+            content: try Self.text(statement, 8),
             sensitivity: sensitivity,
             provenance: try Self.decode(
                 MemoryProvenance.self,
@@ -1053,9 +1931,9 @@ public actor SQLiteMemoryStore: MemoryStore {
                 : Date(timeIntervalSince1970: sqlite3_column_double(statement, 13)),
             revision: Int(sqlite3_column_int64(statement, 14)),
             status: status,
-            deduplicationKey: Self.text(statement, 16),
+            deduplicationKey: try Self.text(statement, 16),
             deduplicationKeyOrigin: MemoryDeduplicationKeyOrigin(
-                rawValue: Self.text(statement, 17)
+                rawValue: try Self.text(statement, 17)
             ) ?? .legacyUnknown,
             metadata: try Self.decode(
                 [String: JSONValue].self,
@@ -1068,10 +1946,10 @@ public actor SQLiteMemoryStore: MemoryStore {
 
     private func decodeEvent(_ statement: OpaquePointer) throws -> MemoryEvent {
         guard
-            let id = UUID(uuidString: Self.text(statement, 0)),
-            let recordID = UUID(uuidString: Self.text(statement, 1)),
-            let level = MemoryScopeLevel(rawValue: Self.text(statement, 2)),
-            let kind = MemoryEventKind(rawValue: Self.text(statement, 8))
+            let id = UUID(uuidString: try Self.text(statement, 0)),
+            let recordID = UUID(uuidString: try Self.text(statement, 1)),
+            let level = MemoryScopeLevel(rawValue: try Self.text(statement, 2)),
+            let kind = MemoryEventKind(rawValue: try Self.text(statement, 8))
         else {
             throw MemoryStoreError.serialization("a memory event contains an unknown enum or UUID")
         }
@@ -1080,11 +1958,11 @@ public actor SQLiteMemoryStore: MemoryStore {
             recordID: recordID,
             scope: MemoryScope(
                 level: level,
-                appID: Self.text(statement, 3),
-                userID: Self.optionalIdentifier(statement, 4),
-                agentID: Self.optionalIdentifier(statement, 5),
-                workspaceID: Self.optionalIdentifier(statement, 6),
-                sessionID: Self.optionalIdentifier(statement, 7)
+                appID: try Self.text(statement, 3),
+                userID: try Self.optionalIdentifier(statement, 4),
+                agentID: try Self.optionalIdentifier(statement, 5),
+                workspaceID: try Self.optionalIdentifier(statement, 6),
+                sessionID: try Self.optionalIdentifier(statement, 7)
             ),
             kind: kind,
             timestamp: Date(timeIntervalSince1970: sqlite3_column_double(statement, 9)),
@@ -1110,15 +1988,24 @@ public actor SQLiteMemoryStore: MemoryStore {
         ]
     }
 
+    private func sourceBindings(_ identity: MemorySourceIdentity) -> [Binding] {
+        [.text(identity.identifier)] + scopeBindings(identity.scope)
+    }
+
+    private func sourceMappingBindings(_ identity: MemorySourceIdentity) -> [Binding] {
+        [.text(identity.identifier)] + scopeBindings(identity.scope)
+    }
+
     private func ownerBindings(appID: String, userID: String) throws -> [Binding] {
-        _ = try MemoryScope.user(appID: appID, userID: userID).validated()
+        let scope = try MemoryScope.user(appID: appID, userID: userID)
+            .validatedForLegacySQLiteAccess()
         return [
             .text(MemoryScopeLevel.user.rawValue),
             .text(MemoryScopeLevel.agent.rawValue),
             .text(MemoryScopeLevel.workspace.rawValue),
             .text(MemoryScopeLevel.session.rawValue),
-            .text(appID),
-            .text(userID),
+            .text(scope.appID),
+            .text(scope.userID ?? ""),
         ]
     }
 
@@ -1151,6 +2038,7 @@ public actor SQLiteMemoryStore: MemoryStore {
             && record.importance == proposal.importance
             && optionalDatesMatch(record.expiresAt, proposedExpiry)
             && record.status == status
+            && record.deduplicationKey == proposal.resolvedDeduplicationKey()
             && record.deduplicationKeyOrigin == proposal.resolvedDeduplicationKeyOrigin()
             && record.metadata == proposal.metadata
     }
@@ -1240,12 +2128,27 @@ public actor SQLiteMemoryStore: MemoryStore {
         let result: Int32
         switch value {
         case .text(let value):
-            result = sqlite3_bind_text(statement, index, value, -1, transient)
+            let byteCount = value.utf8.count
+            guard byteCount <= Int(Int32.max) else {
+                throw MemoryStoreError.database("A text binding exceeds SQLite's byte limit.")
+            }
+            result = value.withCString { pointer in
+                sqlite3_bind_text(
+                    statement,
+                    index,
+                    pointer,
+                    Int32(byteCount),
+                    transient
+                )
+            }
         case .integer(let value):
             result = sqlite3_bind_int64(statement, index, value)
         case .double(let value):
             result = sqlite3_bind_double(statement, index, value)
         case .blob(let data):
+            guard data.count <= Int(Int32.max) else {
+                throw MemoryStoreError.database("A blob binding exceeds SQLite's byte limit.")
+            }
             result = data.withUnsafeBytes { bytes in
                 sqlite3_bind_blob(statement, index, bytes.baseAddress, Int32(bytes.count), transient)
             }
@@ -1294,19 +2197,27 @@ public actor SQLiteMemoryStore: MemoryStore {
         }
         defer { sqlite3_finalize(statement) }
         guard sqlite3_step(statement) == SQLITE_ROW else { throw error(from: database) }
-        return text(statement, 0)
+        return try text(statement, 0)
     }
 
-    private static func text(_ statement: OpaquePointer, _ column: Int32) -> String {
-        guard let value = sqlite3_column_text(statement, column) else { return "" }
-        return String(cString: value)
+    private static func text(_ statement: OpaquePointer, _ column: Int32) throws -> String {
+        let byteCount = Int(sqlite3_column_bytes(statement, column))
+        guard byteCount > 0,
+              let value = sqlite3_column_text(statement, column) else { return "" }
+        guard let decoded = String(
+            bytes: UnsafeBufferPointer(start: value, count: byteCount),
+            encoding: .utf8
+        ) else {
+            throw MemoryStoreError.serialization("a SQLite text column contains invalid UTF-8")
+        }
+        return decoded
     }
 
     private static func optionalIdentifier(
         _ statement: OpaquePointer,
         _ column: Int32
-    ) -> String? {
-        let value = text(statement, column)
+    ) throws -> String? {
+        let value = try text(statement, column)
         return value.isEmpty ? nil : value
     }
 

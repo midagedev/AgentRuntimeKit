@@ -298,7 +298,7 @@ final class AgentRuntimeAppleTests: XCTestCase {
             provenance: MemoryProvenance(source: "apple-protection-test")
         ))
         let diagnostics = try await store.diagnostics()
-        XCTAssertEqual(diagnostics.schemaVersion, 2)
+        XCTAssertEqual(diagnostics.schemaVersion, 5)
 
         let artifacts = [
             databaseURL,

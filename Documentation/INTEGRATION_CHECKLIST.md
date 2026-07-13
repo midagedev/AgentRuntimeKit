@@ -31,6 +31,14 @@
 
 - [ ] The host transcript is durable before a completed checkpoint is removed.
 - [ ] Memory scope and owner isolation have adversarial tests.
+- [ ] File-memory roots are explicit, bounded, and never widened by a local or
+      cloud fallback.
+- [ ] A source discovery/read failure preserves the prior index instead of
+      reconciling an empty snapshot.
+- [ ] File events trigger a complete generation-checked rescan; they are not
+      treated as an authoritative mutation log.
+- [ ] iCloud storage consent is separate from provider data-sharing consent,
+      and real-device account/download/conflict behavior has been verified.
 - [ ] The product exposes exact-record and owner-bound privacy purge.
 - [ ] Backup and filesystem snapshot retention is documented separately.
 - [ ] Logs and audit records contain no credentials, memory bodies, health data,

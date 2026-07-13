@@ -18,6 +18,7 @@ recoverable deleted status.
 
 - ``MemoryStore``
 - ``SQLiteMemoryStore``
+- ``SQLiteLegacyScopeSummary``
 - ``InMemoryMemoryStore``
 - ``MemoryContextProvider``
 

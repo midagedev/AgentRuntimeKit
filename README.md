@@ -28,13 +28,13 @@ Add the package URL in Xcode:
 https://github.com/midagedev/AgentRuntimeKit.git
 ```
 
-Choose a version requirement starting at `0.1.1`, then add only the products
+Choose a version requirement starting at `0.2.0`, then add only the products
 your target needs. SwiftPM consumers can declare:
 
 ```swift
 .package(
     url: "https://github.com/midagedev/AgentRuntimeKit.git",
-    from: "0.1.1"
+    from: "0.2.0"
 )
 ```
 
@@ -56,7 +56,8 @@ See [Getting Started](Documentation/GETTING_STARTED.md) and the
 | `AgentRuntimeCore` | Messages, providers, bounded agent loop, tool schemas, policy, approval, context, checkpoints, audit contracts |
 | `AgentRuntimeProviders` | Anthropic Messages, OpenAI Responses and Chat Completions, Gemini, OpenAI-compatible endpoints, retries and fallback |
 | `AgentRuntimeMemory` | In-memory and SQLite stores, scope isolation, TTL, revisions, FTS/lexical retrieval, policy-controlled memory tools |
-| `AgentRuntimeApple` | Keychain secret store, protected checkpoints, protected SQLite memory, redacted JSONL audit sink |
+| `AgentRuntimeFileMemory` | Read-only Markdown/text directory scanning, deterministic chunking, and atomic source reconciliation into a derived memory index |
+| `AgentRuntimeApple` | Keychain secrets, protected checkpoints/SQLite, redacted JSONL audit, and explicit iCloud Drive file-memory access |
 | `AgentRuntimeMCP` | Dependency-free MCP Streamable HTTP client and policy-compatible tool adapters |
 | `AgentRuntimeTestKit` | Scripted providers, closure tools, and in-memory secrets for host-app tests |
 
@@ -100,7 +101,7 @@ let request = AgentRunRequest(
         providerID: "anthropic",
         model: model,
         instructions: systemPrompt,
-        allowedTools: Set(appTools.map { $0.descriptor.name })
+        allowedTools: Set((memoryTools.tools + appTools).map { $0.descriptor.name })
     ),
     messages: history + [AgentMessage(role: .user, text: input)]
 )
@@ -143,10 +144,19 @@ or similarly sensitive source data should normally be supplied as ephemeral
 context rather than written to long-term memory. Context and system instructions
 are composed only for provider requests; they never enter run results or checkpoints.
 
-The built-in persistent memory backend is SQLite. Version 0.1.x does not yet
-ship a Markdown/JSON directory codec, file watcher, or bidirectional file
-reconciliation layer; passing file contents through a custom context provider is
-not equivalent to managed file-based memory.
+The built-in persistent memory backend is SQLite. `AgentRuntimeFileMemory` can
+treat a Markdown/text directory as canonical user-owned data and SQLite as a
+rebuildable search index. Scans are deterministic and bounded, symbolic links
+and unsafe paths are rejected, and each complete snapshot is reconciled in one
+generation-checked transaction. Missing source chunks are archived by default.
+The scanner is deliberately read-only: host applications remain responsible for
+editing, conflict presentation, backup retention, and user-visible storage
+controls. Apple hosts can opt into an explicit iCloud Drive container through
+`AgentRuntimeApple`; unavailable iCloud never silently falls back to a second
+local directory.
+
+See [File-based Memory](Documentation/FILE_MEMORY.md) for local and iCloud Drive
+integration, limits, rescan triggers, and conflict boundaries.
 
 `delete` is a recoverable status transition. User-facing privacy deletion uses
 the separate idempotent `purge(id:scope:)` or `purge(scopes:)` APIs, which remove
@@ -162,6 +172,11 @@ committed but a physical post-commit step must be retried. Existing custom
 `MemoryStore` conformers remain source-compatible and fail closed until they
 implement the purge requirements. Filesystem snapshots and backups remain the
 host platform's retention responsibility.
+
+When opening a 0.1.x SQLite database, new writes still require canonical scope
+identities. Exact legacy scopes remain readable and erasable; hosts can use
+`legacyScopeInventory()` plus `purgeLegacyPersistedScope(_:)` for an explicit
+administrative cleanup of non-canonical persisted namespaces.
 
 ## Resume and side-effect rule
 
