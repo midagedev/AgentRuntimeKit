@@ -36,7 +36,10 @@ actor. Network, database, and native tool work remain off the main actor.
 8. Execute the native tool with cancellation and a deadline, then return only a
    model-safe result. Persist non-idempotent completion immediately.
 9. Save a resumable checkpoint after each step. Instructions and retrieved context
-   are recomposed for each request and never enter the durable transcript.
+   are recomposed for each request and never enter the durable transcript. A host
+   can persist an opaque `resumeContextFingerprint` so an identity, consent,
+   privacy projection, or tool-policy change invalidates recovery before any
+   provider call without persisting those raw inputs.
 10. Stop on a final assistant message or a configured step, tool, token, or time
    budget.
 

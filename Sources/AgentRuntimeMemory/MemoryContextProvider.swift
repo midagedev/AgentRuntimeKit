@@ -10,9 +10,18 @@ public struct MemoryContextProvider: AgentContextProvider, Sendable {
     public var minimumImportance: Double
     public var limit: Int
     public var workspaceMetadataKey: String
+    /// Requested maximum ranked records inspected when `recordEligibility` is
+    /// present. The effective value is never lower than the final `limit`.
+    /// This bounded overscan prevents ineligible records from consuming the
+    /// provider's final result limit or character budget. A store may enforce
+    /// its own lower operational ceiling.
+    public private(set) var eligibilityCandidateLimit: Int
 
     private let store: any MemoryStore
+    private let recordEligibility: (@Sendable (MemoryRecord) -> Bool)?
 
+    /// Creates a context provider without an additional host eligibility
+    /// policy. This initializer preserves the original public API.
     public init(
         identifier: String = "agent-runtime-memory",
         store: any MemoryStore,
@@ -22,6 +31,38 @@ public struct MemoryContextProvider: AgentContextProvider, Sendable {
         limit: Int = 20,
         workspaceMetadataKey: String = "workspaceID"
     ) {
+        self.init(
+            identifier: identifier,
+            store: store,
+            maximumSensitivity: maximumSensitivity,
+            minimumConfidence: minimumConfidence,
+            minimumImportance: minimumImportance,
+            limit: limit,
+            workspaceMetadataKey: workspaceMetadataKey,
+            recordEligibility: nil,
+            eligibilityCandidateLimit: 200
+        )
+    }
+
+    public init(
+        identifier: String = "agent-runtime-memory",
+        store: any MemoryStore,
+        maximumSensitivity: AgentDataSensitivity = .privateData,
+        minimumConfidence: Double = 0,
+        minimumImportance: Double = 0,
+        limit: Int = 20,
+        workspaceMetadataKey: String = "workspaceID",
+        /// A host policy evaluated against the full durable record before the
+        /// final context limit and character budget are applied. It can inspect
+        /// provenance and metadata without copying those values into context.
+        /// Keep the closure deterministic and free of mutable external state.
+        recordEligibility: (@Sendable (MemoryRecord) -> Bool)?,
+        /// Bounded overscan used only when `recordEligibility` is present. The
+        /// effective candidate count is never lower than `limit`.
+        /// Eligible records ranked beyond this many candidates are deliberately
+        /// not exposed; increase it when a host expects many policy exclusions.
+        eligibilityCandidateLimit: Int = 200
+    ) {
         self.identifier = identifier
         self.store = store
         // Secret values belong in AgentSecretStore and are never model context.
@@ -30,6 +71,8 @@ public struct MemoryContextProvider: AgentContextProvider, Sendable {
         self.minimumImportance = min(1, max(0, minimumImportance))
         self.limit = max(0, limit)
         self.workspaceMetadataKey = workspaceMetadataKey
+        self.recordEligibility = recordEligibility
+        self.eligibilityCandidateLimit = max(0, eligibilityCandidateLimit)
     }
 
     public func context(for request: AgentContextRequest) async throws -> [AgentContextBlock] {
@@ -42,16 +85,33 @@ public struct MemoryContextProvider: AgentContextProvider, Sendable {
             workspaceID: workspaceID,
             sessionID: request.sessionID
         )
+        let filtersDurableRecords = recordEligibility != nil
+        let candidateLimit = filtersDurableRecords
+            ? max(limit, eligibilityCandidateLimit)
+            : limit
         let result = try await store.retrieve(MemoryQuery(
             scopes: scopes,
             text: request.query,
             maximumSensitivity: maximumSensitivity,
             minimumConfidence: minimumConfidence,
             minimumImportance: minimumImportance,
-            limit: limit,
-            characterBudget: request.characterBudget
+            limit: candidateLimit,
+            // A host eligibility policy must run before excluded records can
+            // consume the final context budget. The candidate count remains
+            // bounded by `eligibilityCandidateLimit`.
+            characterBudget: filtersDurableRecords ? .max : request.characterBudget
         ))
-        return result.hits.map { hit in
+        let hits: [MemorySearchHit]
+        if let recordEligibility {
+            hits = Self.fit(
+                result.hits.filter { recordEligibility($0.record) },
+                limit: limit,
+                characterBudget: request.characterBudget
+            )
+        } else {
+            hits = result.hits
+        }
+        return hits.map { hit in
             AgentContextBlock(
                 id: "memory:\(hit.record.id.uuidString)",
                 title: "Memory: \(hit.record.kind.rawValue)",
@@ -71,6 +131,28 @@ public struct MemoryContextProvider: AgentContextProvider, Sendable {
                 ]
             )
         }
+    }
+
+    private static func fit(
+        _ hits: [MemorySearchHit],
+        limit: Int,
+        characterBudget: Int
+    ) -> [MemorySearchHit] {
+        var remaining = max(0, characterBudget)
+        var fitted: [MemorySearchHit] = []
+        fitted.reserveCapacity(min(limit, hits.count))
+
+        for var hit in hits {
+            guard fitted.count < limit, remaining > 0 else { break }
+            if hit.contextText.count > remaining {
+                hit.contextText = String(hit.contextText.prefix(remaining))
+                hit.isTruncated = true
+            }
+            remaining -= hit.contextText.count
+            fitted.append(hit)
+            if hit.isTruncated { break }
+        }
+        return fitted
     }
 
     /// Builds only deliberate shared scopes plus identities belonging to this

@@ -309,6 +309,28 @@ final class AgentRuntimeTests: XCTestCase {
         XCTAssertEqual(stored?.messages.last?.text, "saved")
     }
 
+    func testCheckpointPersistsOpaqueResumeContextFingerprint() async throws {
+        let provider = ScriptedProvider(scripts: [[.textDelta("saved"), .finish(.stop)]])
+        let checkpoints = InMemoryAgentCheckpointStore()
+        let runtime = AgentRuntime(
+            providers: ModelProviderRegistry(providers: [provider]),
+            tools: try AgentToolRegistry(),
+            checkpointStore: checkpoints
+        )
+        var request = makeRequest(sessionID: "fingerprinted-session")
+        request.resumeContextFingerprint = "sha256:opaque-context-digest"
+
+        _ = try await collectEvents(runtime.run(request))
+
+        let stored = await checkpoints.latest(
+            appID: request.appID,
+            userID: request.userID,
+            sessionID: request.sessionID,
+            agentID: request.agent.id
+        )
+        XCTAssertEqual(stored?.resumeContextFingerprint, request.resumeContextFingerprint)
+    }
+
     func testApprovalBrokerPublishesAndResolvesRequest() async throws {
         let broker = AgentToolApprovalBroker()
         let tool = RecordingTool(name: "private.read", risk: .sensitive)
@@ -438,6 +460,109 @@ final class AgentRuntimeTests: XCTestCase {
         }
         let count = await provider.state.requests.count
         XCTAssertEqual(count, 0)
+    }
+
+    func testResumeAcceptsExactContextFingerprintMatch() async throws {
+        let provider = ScriptedProvider(scripts: [[.textDelta("resumed"), .finish(.stop)]])
+        let runtime = AgentRuntime(
+            providers: ModelProviderRegistry(providers: [provider]),
+            tools: try AgentToolRegistry()
+        )
+        var request = makeRequest()
+        request.resumeContextFingerprint = "sha256:exact-context"
+        request.resumeFrom = makeStoredCheckpoint(
+            resumeContextFingerprint: "sha256:exact-context"
+        )
+
+        let events = try await collectEvents(runtime.run(request))
+
+        guard case .completed(let result) = events.last else {
+            return XCTFail("Expected resumed completion")
+        }
+        XCTAssertEqual(result.finalMessage.text, "resumed")
+        let count = await provider.state.requests.count
+        XCTAssertEqual(count, 1)
+    }
+
+    func testResumeRejectsContextFingerprintMismatchBeforeCallingProvider() async throws {
+        let provider = ScriptedProvider(scripts: [[.textDelta("must not run")]])
+        let runtime = AgentRuntime(
+            providers: ModelProviderRegistry(providers: [provider]),
+            tools: try AgentToolRegistry()
+        )
+        var request = makeRequest()
+        request.resumeContextFingerprint = "sha256:current-context"
+        request.resumeFrom = makeStoredCheckpoint(
+            resumeContextFingerprint: "sha256:previous-context"
+        )
+
+        do {
+            _ = try await collectEvents(runtime.run(request))
+            XCTFail("Expected context fingerprint mismatch")
+        } catch let error as AgentRuntimeError {
+            XCTAssertEqual(
+                error,
+                .resumeCheckpointMismatch(field: "resumeContextFingerprint")
+            )
+            XCTAssertFalse(error.localizedDescription.contains("previous-context"))
+            XCTAssertFalse(error.localizedDescription.contains("current-context"))
+        }
+        let count = await provider.state.requests.count
+        XCTAssertEqual(count, 0)
+    }
+
+    func testLegacyNilContextFingerprintResumesOnlyWhenRequestAlsoOmitsIt() async throws {
+        let provider = ScriptedProvider(scripts: [[.textDelta("legacy resumed"), .finish(.stop)]])
+        let runtime = AgentRuntime(
+            providers: ModelProviderRegistry(providers: [provider]),
+            tools: try AgentToolRegistry()
+        )
+        var legacyRequest = makeRequest()
+        legacyRequest.resumeFrom = makeStoredCheckpoint()
+
+        let events = try await collectEvents(runtime.run(legacyRequest))
+        guard case .completed(let result) = events.last else {
+            return XCTFail("Expected legacy checkpoint completion")
+        }
+        XCTAssertEqual(result.finalMessage.text, "legacy resumed")
+
+        let blockedProvider = ScriptedProvider(scripts: [[.textDelta("must not run")]])
+        let blockedRuntime = AgentRuntime(
+            providers: ModelProviderRegistry(providers: [blockedProvider]),
+            tools: try AgentToolRegistry()
+        )
+        var fingerprintedRequest = makeRequest()
+        fingerprintedRequest.resumeContextFingerprint = "sha256:new-context-contract"
+        fingerprintedRequest.resumeFrom = makeStoredCheckpoint()
+        do {
+            _ = try await collectEvents(blockedRuntime.run(fingerprintedRequest))
+            XCTFail("Expected legacy checkpoint to fail the new fingerprint contract")
+        } catch let error as AgentRuntimeError {
+            XCTAssertEqual(
+                error,
+                .resumeCheckpointMismatch(field: "resumeContextFingerprint")
+            )
+        }
+        let blockedCount = await blockedProvider.state.requests.count
+        XCTAssertEqual(blockedCount, 0)
+    }
+
+    func testCheckpointDecodesLegacyPayloadWithoutContextFingerprint() throws {
+        let current = makeStoredCheckpoint(
+            resumeContextFingerprint: "sha256:field-to-remove"
+        )
+        let encoded = try JSONEncoder().encode(current)
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        XCTAssertNotNil(object.removeValue(forKey: "resumeContextFingerprint"))
+        let legacyData = try JSONSerialization.data(withJSONObject: object)
+
+        let decoded = try JSONDecoder().decode(AgentRunCheckpoint.self, from: legacyData)
+
+        XCTAssertNil(decoded.resumeContextFingerprint)
+        XCTAssertEqual(decoded.id, current.id)
+        XCTAssertEqual(decoded.messages, current.messages)
     }
 
     func testFreshRunRejectsOlderUnresolvedNonIdempotentExecutionHiddenByNewerCheckpoint() async throws {
@@ -695,6 +820,7 @@ final class AgentRuntimeTests: XCTestCase {
 private func makeStoredCheckpoint(
     messages: [AgentMessage] = [AgentMessage(role: .user, text: "hello")],
     createdAt: Date = .now,
+    resumeContextFingerprint: String? = nil,
     toolExecutions: [AgentToolExecutionRecord] = []
 ) -> AgentRunCheckpoint {
     AgentRunCheckpoint(
@@ -705,6 +831,7 @@ private func makeStoredCheckpoint(
         agentID: "assistant",
         providerID: "test",
         model: "test-model",
+        resumeContextFingerprint: resumeContextFingerprint,
         messages: messages,
         stepCount: 1,
         toolCallCount: toolExecutions.count,

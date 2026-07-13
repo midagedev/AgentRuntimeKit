@@ -5,6 +5,23 @@ All notable changes to AgentRuntimeKit are documented here. The project follows
 
 ## [Unreleased]
 
+### Added
+
+- Added an optional host-computed `resumeContextFingerprint` to run requests and
+  checkpoints. Resume now requires exact optional-value equality before any
+  provider call, while legacy fingerprint-free checkpoints remain decodable.
+- Added bounded `MemoryContextProvider` eligibility filtering over complete
+  durable records so hosts can apply provenance and metadata policy before the
+  final model-context result limit and character budget.
+
+### Security
+
+- Resume fingerprints are checkpoint-only opaque values: they are not included
+  in provider requests or audit detail, and mismatches report only the field
+  name rather than either value.
+- SQLite candidate overscan now saturates safely for maximum-integer retrieval
+  limits instead of overflowing before applying its operational ceiling.
+
 ## [0.2.1] - 2026-07-13
 
 ### Added

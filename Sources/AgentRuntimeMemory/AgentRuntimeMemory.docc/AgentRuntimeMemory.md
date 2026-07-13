@@ -12,6 +12,11 @@ Secret proposals fail closed. Sensitive durable memory should pass through a hos
 approval flow, and privacy erasure should use hard-purge APIs rather than the
 recoverable deleted status.
 
+Use ``MemoryContextProvider/init(identifier:store:maximumSensitivity:minimumConfidence:minimumImportance:limit:workspaceMetadataKey:recordEligibility:eligibilityCandidateLimit:)``
+to apply a host `@Sendable` eligibility policy over durable record provenance and
+metadata. Candidate overscan is bounded, while policy exclusions occur before the
+final model-context result limit and character budget.
+
 ## Topics
 
 ### Stores and retrieval
