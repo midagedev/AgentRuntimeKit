@@ -167,6 +167,10 @@ public struct AgentRunCheckpoint: Sendable, Codable, Hashable, Identifiable {
     public var agentID: String
     public var providerID: String
     public var model: String
+    /// The opaque host-computed context fingerprint required to resume this
+    /// checkpoint. Missing values decode as `nil` for checkpoints written by
+    /// earlier AgentRuntimeKit releases.
+    public var resumeContextFingerprint: String?
     public var messages: [AgentMessage]
     public var stepCount: Int
     public var toolCallCount: Int
@@ -174,6 +178,11 @@ public struct AgentRunCheckpoint: Sendable, Codable, Hashable, Identifiable {
     public var toolExecutions: [AgentToolExecutionRecord]
     public var createdAt: Date
 
+    /// Creates a checkpoint without a resume-context contract.
+    ///
+    /// This initializer preserves the pre-fingerprint API. New checkpoint
+    /// writers should use the overload containing `resumeContextFingerprint`
+    /// when a host run supplies one.
     public init(
         id: UUID = UUID(),
         runID: UUID,
@@ -190,6 +199,42 @@ public struct AgentRunCheckpoint: Sendable, Codable, Hashable, Identifiable {
         toolExecutions: [AgentToolExecutionRecord] = [],
         createdAt: Date = .now
     ) {
+        self.init(
+            id: id,
+            runID: runID,
+            sessionID: sessionID,
+            appID: appID,
+            userID: userID,
+            agentID: agentID,
+            providerID: providerID,
+            model: model,
+            resumeContextFingerprint: nil,
+            messages: messages,
+            stepCount: stepCount,
+            toolCallCount: toolCallCount,
+            usage: usage,
+            toolExecutions: toolExecutions,
+            createdAt: createdAt
+        )
+    }
+
+    public init(
+        id: UUID = UUID(),
+        runID: UUID,
+        sessionID: String,
+        appID: String,
+        userID: String? = nil,
+        agentID: String,
+        providerID: String,
+        model: String,
+        resumeContextFingerprint: String?,
+        messages: [AgentMessage],
+        stepCount: Int,
+        toolCallCount: Int,
+        usage: AgentTokenUsage,
+        toolExecutions: [AgentToolExecutionRecord] = [],
+        createdAt: Date = .now
+    ) {
         self.id = id
         self.runID = runID
         self.sessionID = sessionID
@@ -198,6 +243,7 @@ public struct AgentRunCheckpoint: Sendable, Codable, Hashable, Identifiable {
         self.agentID = agentID
         self.providerID = providerID
         self.model = model
+        self.resumeContextFingerprint = resumeContextFingerprint
         self.messages = messages
         self.stepCount = stepCount
         self.toolCallCount = toolCallCount

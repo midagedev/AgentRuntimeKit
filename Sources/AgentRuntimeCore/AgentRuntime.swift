@@ -67,6 +67,15 @@ public struct AgentRunRequest: Sendable, Hashable {
     public var agent: AgentDefinition
     public var messages: [AgentMessage]
     public var resumeFrom: AgentRunCheckpoint?
+    /// An opaque host-computed digest of identity, consent, privacy projection,
+    /// and other context inputs that must remain unchanged across a resume.
+    ///
+    /// The runtime compares this value exactly with the checkpoint and never
+    /// sends it to a model provider or includes it in audit detail. Hosts should
+    /// hash a canonical representation and must not put raw private data here.
+    /// A legacy checkpoint without a fingerprint can only resume a request that
+    /// also omits one.
+    public var resumeContextFingerprint: String?
     public var limits: AgentRunLimits
     public var requiresAllContextProviders: Bool
     public var requiresCheckpointPersistence: Bool
@@ -74,6 +83,11 @@ public struct AgentRunRequest: Sendable, Hashable {
     public var metadata: [String: JSONValue]
     public var providerMetadata: [String: JSONValue]
 
+    /// Creates a run without a resume-context contract.
+    ///
+    /// This initializer preserves the pre-fingerprint API. Use the overload
+    /// containing `resumeContextFingerprint` when mutable host privacy or
+    /// identity state must invalidate checkpoint recovery.
     public init(
         id: UUID = UUID(),
         sessionID: String,
@@ -89,6 +103,40 @@ public struct AgentRunRequest: Sendable, Hashable {
         metadata: [String: JSONValue] = [:],
         providerMetadata: [String: JSONValue] = [:]
     ) {
+        self.init(
+            id: id,
+            sessionID: sessionID,
+            appID: appID,
+            userID: userID,
+            agent: agent,
+            messages: messages,
+            resumeFrom: resumeFrom,
+            resumeContextFingerprint: nil,
+            limits: limits,
+            requiresAllContextProviders: requiresAllContextProviders,
+            requiresCheckpointPersistence: requiresCheckpointPersistence,
+            responseSchema: responseSchema,
+            metadata: metadata,
+            providerMetadata: providerMetadata
+        )
+    }
+
+    public init(
+        id: UUID = UUID(),
+        sessionID: String,
+        appID: String,
+        userID: String? = nil,
+        agent: AgentDefinition,
+        messages: [AgentMessage],
+        resumeFrom: AgentRunCheckpoint? = nil,
+        resumeContextFingerprint: String?,
+        limits: AgentRunLimits = AgentRunLimits(),
+        requiresAllContextProviders: Bool = false,
+        requiresCheckpointPersistence: Bool = false,
+        responseSchema: JSONValue? = nil,
+        metadata: [String: JSONValue] = [:],
+        providerMetadata: [String: JSONValue] = [:]
+    ) {
         self.id = id
         self.sessionID = sessionID
         self.appID = appID
@@ -96,6 +144,7 @@ public struct AgentRunRequest: Sendable, Hashable {
         self.agent = agent
         self.messages = messages
         self.resumeFrom = resumeFrom
+        self.resumeContextFingerprint = resumeContextFingerprint
         self.limits = limits
         self.requiresAllContextProviders = requiresAllContextProviders
         self.requiresCheckpointPersistence = requiresCheckpointPersistence
@@ -863,6 +912,7 @@ public actor AgentRuntime {
             agentID: request.agent.id,
             providerID: request.agent.providerID,
             model: request.agent.model,
+            resumeContextFingerprint: request.resumeContextFingerprint,
             messages: messages,
             stepCount: stepCount,
             toolCallCount: toolCallCount,
@@ -903,6 +953,9 @@ public actor AgentRuntime {
         }
         guard checkpoint.model == request.agent.model else {
             throw AgentRuntimeError.resumeCheckpointMismatch(field: "model")
+        }
+        guard checkpoint.resumeContextFingerprint == request.resumeContextFingerprint else {
+            throw AgentRuntimeError.resumeCheckpointMismatch(field: "resumeContextFingerprint")
         }
     }
 

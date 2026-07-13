@@ -103,7 +103,10 @@ let request = AgentRunRequest(
         instructions: systemPrompt,
         allowedTools: Set((memoryTools.tools + appTools).map { $0.descriptor.name })
     ),
-    messages: history + [AgentMessage(role: .user, text: input)]
+    messages: history + [AgentMessage(role: .user, text: input)],
+    // Hash a canonical host representation; never persist raw identity or
+    // consent values as the fingerprint itself.
+    resumeContextFingerprint: privacyProjectionDigest
 )
 
 for try await event in runtime.run(request) {
@@ -184,6 +187,17 @@ Provider-signed or encrypted continuation items are stored opaquely on assistant
 messages so Gemini, Anthropic, and OpenAI reasoning tool loops can resume exactly.
 They are never emitted in UI or audit events and are replayed only by the adapter
 whose identifier and format match.
+
+`resumeContextFingerprint` lets a host bind recovery to the identity, consent,
+memory projection, and tool-policy inputs that were valid when a checkpoint was
+written. The runtime persists only this host-computed opaque digest and requires
+exact equality before any provider call. A legacy checkpoint without a fingerprint
+can resume only when the new request also omits one.
+
+`MemoryContextProvider` can also accept a `@Sendable` `recordEligibility` policy
+over the full durable `MemoryRecord`. The provider performs bounded candidate
+overscan, applies that policy before the final result limit and character budget,
+and exposes neither provenance nor policy-only metadata to the model by default.
 
 Non-idempotent tools require a durable checkpoint store. The runtime writes a
 `started` ledger record before execution and a `completed` record with the tool

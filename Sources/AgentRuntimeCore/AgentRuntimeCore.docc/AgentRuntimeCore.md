@@ -15,6 +15,11 @@ non-idempotent work, and persist the host transcript before removing a completed
 checkpoint. See the repository's production integration checklist for the full
 host contract.
 
+When a checkpoint depends on mutable identity, consent, privacy projection, or
+tool-policy state, supply an opaque ``AgentRunRequest/resumeContextFingerprint``.
+The runtime stores it on ``AgentRunCheckpoint`` and requires exact equality before
+recovery. Hash a canonical host representation; do not use raw private values.
+
 ## Topics
 
 ### Running an agent

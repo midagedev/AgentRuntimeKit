@@ -249,6 +249,23 @@ final class SQLiteMemoryStoreTests: XCTestCase {
         XCTAssertTrue(fitted.exhaustedBudget)
     }
 
+    func testMaximumIntegerRetrievalLimitDoesNotOverflowCandidateOverscan() async throws {
+        let store = try makeStore()
+        let scope = MemoryScope.user(appID: "app", userID: "user")
+        let record = try await store.upsert(proposal(
+            scope: scope,
+            content: "bounded retrieval"
+        ))
+
+        let result = try await store.retrieve(MemoryQuery(
+            scopes: [scope],
+            limit: .max,
+            characterBudget: 1_000
+        ))
+
+        XCTAssertEqual(result.records.map(\.id), [record.id])
+    }
+
     func testRecordsAndEventsPersistAcrossReopen() async throws {
         let directory = try makeTemporaryDirectory()
         let databaseURL = directory.appendingPathComponent("memory.sqlite")

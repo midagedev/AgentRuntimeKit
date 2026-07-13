@@ -171,6 +171,116 @@ final class MemoryPolicyAndContextTests: XCTestCase {
         XCTAssertTrue(blocks.isEmpty)
     }
 
+    func testContextEligibilityFiltersBeforeFinalBudgetAndLimit() async throws {
+        let store = InMemoryMemoryStore()
+        let scope = MemoryScope.user(appID: "app", userID: "user")
+
+        func insert(
+            _ content: String,
+            source: String,
+            eligible: Bool,
+            importance: Double
+        ) async throws {
+            var value = proposal(
+                scope: scope,
+                sensitivity: .privateData,
+                content: content
+            )
+            value.provenance.source = source
+            value.provenance.metadata = ["projection": .string("provider")]
+            value.metadata = ["providerEligible": .bool(eligible)]
+            value.importance = importance
+            _ = try await store.upsert(value)
+        }
+
+        // These higher-ranked records would consume both a non-overscanned
+        // result limit and the tiny character budget if filtering happened
+        // after ordinary retrieval.
+        try await insert(
+            String(repeating: "excluded-source ", count: 100),
+            source: "host-authored",
+            eligible: true,
+            importance: 1
+        )
+        try await insert(
+            String(repeating: "excluded-metadata ", count: 100),
+            source: "file-memory",
+            eligible: false,
+            importance: 0.9
+        )
+        try await insert("alpha", source: "file-memory", eligible: true, importance: 0.8)
+        try await insert("bravo", source: "file-memory", eligible: true, importance: 0.7)
+        try await insert("charlie", source: "file-memory", eligible: true, importance: 0.6)
+
+        let provider = MemoryContextProvider(
+            store: store,
+            limit: 2,
+            recordEligibility: { record in
+                record.provenance.source == "file-memory"
+                    && record.provenance.metadata["projection"] == .string("provider")
+                    && record.metadata["providerEligible"] == .bool(true)
+            },
+            eligibilityCandidateLimit: 5
+        )
+        let blocks = try await provider.context(for: AgentContextRequest(
+            runID: UUID(),
+            sessionID: "session",
+            appID: "app",
+            userID: "user",
+            agentID: "agent",
+            query: "",
+            characterBudget: 9
+        ))
+
+        XCTAssertEqual(blocks.count, 2)
+        XCTAssertEqual(blocks.map(\.content), ["alpha", "brav"])
+        XCTAssertEqual(blocks.reduce(0) { $0 + $1.content.count }, 9)
+        XCTAssertEqual(blocks.last?.metadata["truncated"], .bool(true))
+    }
+
+    func testContextEligibilityCandidateLimitIsAHardBound() async throws {
+        let store = InMemoryMemoryStore()
+        let scope = MemoryScope.user(appID: "app", userID: "user")
+        for index in 0..<3 {
+            var excluded = proposal(
+                scope: scope,
+                sensitivity: .privateData,
+                content: "excluded-\(index)"
+            )
+            excluded.importance = 1 - (Double(index) * 0.1)
+            excluded.metadata = ["providerEligible": .bool(false)]
+            _ = try await store.upsert(excluded)
+        }
+        var eligible = proposal(
+            scope: scope,
+            sensitivity: .privateData,
+            content: "eligible-beyond-bound"
+        )
+        eligible.importance = 0.1
+        eligible.metadata = ["providerEligible": .bool(true)]
+        _ = try await store.upsert(eligible)
+
+        let provider = MemoryContextProvider(
+            store: store,
+            limit: 1,
+            recordEligibility: {
+                $0.metadata["providerEligible"] == .bool(true)
+            },
+            eligibilityCandidateLimit: 3
+        )
+        let blocks = try await provider.context(for: AgentContextRequest(
+            runID: UUID(),
+            sessionID: "session",
+            appID: "app",
+            userID: "user",
+            agentID: "agent",
+            query: "",
+            characterBudget: 1_000
+        ))
+
+        XCTAssertTrue(blocks.isEmpty)
+    }
+
     private func proposal(
         scope: MemoryScope,
         sensitivity: AgentDataSensitivity,

@@ -1804,7 +1804,7 @@ public actor SQLiteMemoryStore: MemoryStore, MemorySourceReconciliationStore {
             ORDER BY bm25(memory_records_fts), m.importance DESC, m.updated_at DESC
             LIMIT ?
             """
-        let boundLimit = min(2_000, max(200, query.limit * 20))
+        let boundLimit = Self.boundedRetrievalCandidateLimit(for: query.limit)
         return try records(
             database,
             sql: sql,
@@ -1829,12 +1829,17 @@ public actor SQLiteMemoryStore: MemoryStore, MemorySourceReconciliationStore {
             ORDER BY m.importance DESC, m.updated_at DESC
             LIMIT ?
             """
-        let boundLimit = min(2_000, max(200, query.limit * 20))
+        let boundLimit = Self.boundedRetrievalCandidateLimit(for: query.limit)
         return try records(
             database,
             sql: sql,
             bindings: filter.bindings + [.integer(Int64(boundLimit))]
         )
+    }
+
+    private static func boundedRetrievalCandidateLimit(for requestedLimit: Int) -> Int {
+        let (scaled, overflow) = requestedLimit.multipliedReportingOverflow(by: 20)
+        return min(2_000, max(200, overflow ? .max : scaled))
     }
 
     private func queryFilter(
