@@ -112,6 +112,60 @@ semantics. Removal is limited to a regular root-relative file and supports
 idempotent or modification-date-preconditioned cleanup. Existing ubiquitous
 items must be current and conflict-free before a write or removal proceeds.
 
+AgentRuntimeKit 0.2.1 adds retry-safe conditional removal for cleanup journals.
+After a bounded coordinated read, prefer the digest-bound overload:
+
+```swift
+let removed = try await cloud.removeFileIfPresent(
+    at: generatedDocumentPath,
+    matchingModifiedAt: lastPublishedModificationDate,
+    matchingSHA256: lastPublishedSHA256,
+    maximumByteCount: fileMemoryConfiguration.maximumFileByteCount
+)
+```
+
+The result is `true` only when that matching file was deleted. It is `false` if
+the file is already absent, including a retry after deletion succeeded but the
+host crashed before committing its journal. `matchingSHA256` must be exactly 64
+lowercase hexadecimal characters, and `maximumByteCount` must be the positive,
+explicit upper bound accepted by the preceding read. Digest verification opens
+the regular file relative to its pinned parent descriptor without following
+symbolic links, hashes no more than that bound plus the one-byte growth probe
+inside `NSFileCoordinator` deletion coordination, and checks the full file
+snapshot before and after hashing and again immediately before unlinking.
+Caller cancellation is forwarded to the coordinated worker, checked during
+bounded hashing, and checked again at the destructive commit point.
+
+An existing file with a different modification date or digest, or a
+snapshot/identity change observed during coordinated removal, fails with
+`ICloudDriveFileMemoryError.removePreconditionFailed`; symbolic links,
+non-current items, unresolved versions, and container identity changes keep
+their typed fail-closed errors. An invalid digest, a non-positive limit, or a
+file larger than the limit throws the content-free
+`ICloudDriveDigestRemovalError` instead of reading unbounded content. Digest
+syntax validation inspects at most 65 UTF-8 bytes before any iCloud container
+lookup or root mutation.
+
+The modification-date-only overload remains available for callers without a
+content digest:
+
+```swift
+let removed = try await cloud.removeFileIfPresent(
+    at: generatedDocumentPath,
+    matchingModifiedAt: lastPublishedModificationDate
+)
+```
+
+It retains the coordinated snapshot and identity fences, but a modification
+date alone cannot identify content replaced before the deletion coordination
+with the same timestamp. Prefer the digest-bound overload after a coordinated
+read. Do not replace either conditional API with `ifExists` for user-editable
+or cross-device files: `ICloudDriveRemoveMode.ifExists` intentionally has no
+modification-date or digest precondition. The observed `Date` is not an
+account-bound `NSFileVersion` token. After an iCloud identity or
+container-change error, throw it away and obtain new precondition values from a
+fresh coordinated read rather than replaying them against a different account.
+
 iCloud selection should be explicit and reversible in the host UI. If the user
 is signed out, the entitlement is missing, or the container cannot be resolved,
 the adapter returns an error and does not use a local fallback. This avoids two

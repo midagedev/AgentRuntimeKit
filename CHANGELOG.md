@@ -5,6 +5,36 @@ All notable changes to AgentRuntimeKit are documented here. The project follows
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-13
+
+### Added
+
+- Added `ICloudDriveFileMemoryAccess.removeFileIfPresent(at:matchingModifiedAt:)`
+  for crash-retryable cleanup: a missing file returns `false`, a matching file
+  is deleted and returns `true`, and an existing changed file fails closed.
+- Added the digest-bound
+  `removeFileIfPresent(at:matchingModifiedAt:matchingSHA256:maximumByteCount:)`
+  overload for cleanup after a bounded coordinated read. It requires an exact
+  64-character lowercase SHA-256 digest and an explicit positive byte limit;
+  missing-file retries return `false`, while invalid or oversized requests
+  throw the content-free `ICloudDriveDigestRemovalError`.
+
+### Security
+
+- Recheck the coordinated file's descriptor-rooted full snapshot and
+  modification date immediately before removal so stale listings and changes
+  observed during coordinated validation fail closed. Current-version,
+  unresolved-conflict, symbolic-link, and iCloud container-identity fences
+  remain enforced.
+- Digest-bound removal hashes through descriptor-rooted, `O_NOFOLLOW`, bounded
+  access inside `NSFileCoordinator` deletion coordination, with full-snapshot
+  checks before and after hashing and immediately before unlinking. Digest,
+  date, snapshot, or identity mismatches fail with
+  `ICloudDriveFileMemoryError.removePreconditionFailed`, including same-size,
+  same-modification-date content replacement. Caller cancellation is forwarded
+  to the coordinated worker and rechecked before unlinking; digest syntax is
+  rejected through bounded UTF-8 inspection before container lookup.
+
 ## [0.2.0] - 2026-07-13
 
 ### Added
@@ -77,7 +107,8 @@ All notable changes to AgentRuntimeKit are documented here. The project follows
 - Opt-in live Anthropic contracts for streaming, continuation, tools,
   cancellation, and sanitized authentication failures.
 
-[Unreleased]: https://github.com/midagedev/AgentRuntimeKit/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/midagedev/AgentRuntimeKit/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/midagedev/AgentRuntimeKit/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/midagedev/AgentRuntimeKit/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/midagedev/AgentRuntimeKit/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/midagedev/AgentRuntimeKit/releases/tag/v0.1.0
