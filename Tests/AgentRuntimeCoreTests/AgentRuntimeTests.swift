@@ -248,16 +248,20 @@ final class AgentRuntimeTests: XCTestCase {
             [.toolCall(call), .finish(.toolCalls)],
             [.textDelta("recovered"), .finish(.stop)],
         ])
+        let tool = CancellationIgnoringTool()
         let runtime = AgentRuntime(
             providers: ModelProviderRegistry(providers: [provider]),
-            tools: try AgentToolRegistry(tools: [CancellationIgnoringTool()])
+            tools: try AgentToolRegistry(tools: [tool])
         )
-        let clock = ContinuousClock()
-        let start = clock.now
 
         let events = try await collectEvents(runtime.run(makeRequest()))
+        let didFinishBeforeRuntimeReturned = await tool.didFinish
+        await tool.release()
 
-        XCTAssertLessThan(start.duration(to: clock.now), .milliseconds(150))
+        XCTAssertFalse(
+            didFinishBeforeRuntimeReturned,
+            "The runtime must return on deadline without waiting for cancellation-ignoring work"
+        )
         guard case .completed(let result) = events.last else {
             return XCTFail("Expected completion after deadline")
         }

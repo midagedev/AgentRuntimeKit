@@ -167,13 +167,26 @@ actor CancellationIgnoringTool: AgentTool {
         timeout: .milliseconds(20)
     )
 
+    private var pendingContinuation: CheckedContinuation<Void, Never>?
+    private var releaseRequested = false
+    private(set) var didFinish = false
+
     func execute(arguments: JSONValue, context: AgentToolExecutionContext) async throws -> AgentToolOutput {
         await withCheckedContinuation { continuation in
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.25) {
+            if releaseRequested {
                 continuation.resume()
+            } else {
+                pendingContinuation = continuation
             }
         }
+        didFinish = true
         return AgentToolOutput(text: "late")
+    }
+
+    func release() {
+        releaseRequested = true
+        pendingContinuation?.resume()
+        pendingContinuation = nil
     }
 }
 
