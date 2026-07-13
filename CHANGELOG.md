@@ -5,6 +5,22 @@ All notable changes to AgentRuntimeKit are documented here. The project follows
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-13
+
+### Added
+
+- Added `ICloudDriveFileMemoryAccess.removeFileIfPresent(at:matchingModifiedAt:)`
+  for crash-retryable cleanup: a missing file returns `false`, a matching file
+  is deleted and returns `true`, and an existing changed file fails closed.
+
+### Security
+
+- Recheck the coordinated file's descriptor-rooted full snapshot and
+  modification date immediately before removal so stale listings and changes
+  observed during coordinated validation fail closed. Current-version,
+  unresolved-conflict, symbolic-link, and iCloud container-identity fences
+  remain enforced.
+
 ## [0.2.0] - 2026-07-13
 
 ### Added
@@ -77,7 +93,8 @@ All notable changes to AgentRuntimeKit are documented here. The project follows
 - Opt-in live Anthropic contracts for streaming, continuation, tools,
   cancellation, and sanitized authentication failures.
 
-[Unreleased]: https://github.com/midagedev/AgentRuntimeKit/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/midagedev/AgentRuntimeKit/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/midagedev/AgentRuntimeKit/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/midagedev/AgentRuntimeKit/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/midagedev/AgentRuntimeKit/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/midagedev/AgentRuntimeKit/releases/tag/v0.1.0

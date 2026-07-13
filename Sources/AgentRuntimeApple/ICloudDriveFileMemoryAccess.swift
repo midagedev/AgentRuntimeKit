@@ -94,6 +94,34 @@ public enum ICloudDriveRemoveMode: Sendable, Equatable {
     case ifUnmodified(modifiedAt: Date)
 }
 
+private enum ICloudDriveRemovalPolicy: Sendable {
+    case mode(ICloudDriveRemoveMode)
+    case ifPresentAndUnmodified(modifiedAt: Date)
+
+    var allowsMissingFile: Bool {
+        switch self {
+        case .mode(.ifExists), .ifPresentAndUnmodified:
+            true
+        case .mode(.requireExisting), .mode(.ifUnmodified):
+            false
+        }
+    }
+
+    var expectedModificationDate: Date? {
+        switch self {
+        case .mode(.ifUnmodified(let modifiedAt)),
+             .ifPresentAndUnmodified(let modifiedAt):
+            modifiedAt
+        case .mode(.ifExists), .mode(.requireExisting):
+            nil
+        }
+    }
+}
+
+private enum ICloudDriveDescriptorTraversalError: Error {
+    case missingIntermediateDirectory
+}
+
 /// One entitlement-scoped iCloud container lookup.
 ///
 /// `identityGeneration` is process-local and changes when the locator observes
@@ -374,9 +402,10 @@ public actor ICloudDriveFileMemoryAccess: FileMemoryFileAccess {
 
     /// Atomically creates or replaces one root-relative file.
     ///
-    /// This is the only mutation boundary intentionally exposed by the adapter.
-    /// It does not move, delete, or merge documents and never resolves version
-    /// conflicts by choosing a winner silently.
+    /// Writes and root-relative removals are the only mutation boundaries
+    /// intentionally exposed by the adapter. This operation does not move,
+    /// delete, or merge documents and never resolves version conflicts by
+    /// choosing a winner silently.
     public func writeFile(
         _ data: Data,
         at path: FileMemoryPath,
@@ -448,6 +477,34 @@ public actor ICloudDriveFileMemoryAccess: FileMemoryFileAccess {
         at path: FileMemoryPath,
         mode: ICloudDriveRemoveMode = .ifExists
     ) async throws -> Bool {
+        try await removeFile(at: path, policy: .mode(mode))
+    }
+
+    /// Removes an app-owned regular file only when it still has the modification
+    /// date previously returned by a coordinated read or directory listing.
+    ///
+    /// A missing file returns `false`, including a retry after a prior call
+    /// deleted the file but the host crashed before recording success. A matching
+    /// file is deleted and returns `true`; a modification-date mismatch or a
+    /// snapshot/identity change observed during coordinated removal fails with
+    /// ``ICloudDriveFileMemoryError/removePreconditionFailed``. Callers must
+    /// discard the observed date and rescan after an iCloud identity or container
+    /// change.
+    @discardableResult
+    public func removeFileIfPresent(
+        at path: FileMemoryPath,
+        matchingModifiedAt modifiedAt: Date
+    ) async throws -> Bool {
+        try await removeFile(
+            at: path,
+            policy: .ifPresentAndUnmodified(modifiedAt: modifiedAt)
+        )
+    }
+
+    private func removeFile(
+        at path: FileMemoryPath,
+        policy: ICloudDriveRemovalPolicy
+    ) async throws -> Bool {
         guard !path.components.isEmpty else {
             throw FileMemoryError.notRegularFile(path)
         }
@@ -460,18 +517,36 @@ public actor ICloudDriveFileMemoryAccess: FileMemoryFileAccess {
             rootURL: resolved.rootURL
         )
         guard itemExists else {
-            if case .ifExists = mode {
+            if policy.allowsMissingFile {
                 try await ensureContainerUnchanged(resolved.location)
                 return false
             }
             throw ICloudDriveFileMemoryError.removePreconditionFailed
         }
-        try await awaitDownloadReadiness(at: target, requireCurrentVersion: true)
+        do {
+            try await awaitDownloadReadiness(at: target, requireCurrentVersion: true)
+        } catch let error as ICloudDriveFileMemoryError
+            where policy.allowsMissingFile && error == .downloadFailed
+        {
+            // The item may have disappeared after the coordinated existence
+            // check but before ubiquitous-item metadata could be read. Only
+            // convert that specific race to the documented missing no-op; a
+            // still-present item keeps the original current-version failure.
+            let stillExists = try await Self.coordinatedItemExists(
+                at: target,
+                path: path,
+                rootURL: resolved.rootURL
+            )
+            guard !stillExists else { throw error }
+            try await ensureContainerUnchanged(resolved.location)
+            return false
+        }
+        try await ensureContainerUnchanged(resolved.location)
         let removed = try await Self.coordinatedRemoveFile(
             at: target,
             path: path,
             rootURL: resolved.rootURL,
-            mode: mode,
+            policy: policy,
             coordinatedItemValidator: coordinatedItemValidator
         )
         try await ensureContainerUnchanged(resolved.location)
@@ -900,7 +975,7 @@ public actor ICloudDriveFileMemoryAccess: FileMemoryFileAccess {
         at url: URL,
         path: FileMemoryPath,
         rootURL: URL,
-        mode: ICloudDriveRemoveMode,
+        policy: ICloudDriveRemovalPolicy,
         coordinatedItemValidator: @escaping @Sendable (URL) throws -> Void
     ) async throws -> Bool {
         try await Task.detached {
@@ -920,29 +995,52 @@ public actor ICloudDriveFileMemoryAccess: FileMemoryFileAccess {
                     ), !versions.isEmpty {
                         throw ICloudDriveFileMemoryError.unresolvedVersionConflict
                     }
-                    let parent = try openDirectory(
-                        rootURL: rootURL,
-                        relativeComponents: path.parent?.components ?? [],
-                        createMissing: false
-                    )
+                    let parent: Int32
+                    do {
+                        parent = try openDirectory(
+                            rootURL: rootURL,
+                            relativeComponents: path.parent?.components ?? [],
+                            createMissing: false,
+                            missingIntermediateIsAbsent: true
+                        )
+                    } catch ICloudDriveDescriptorTraversalError.missingIntermediateDirectory {
+                        if policy.allowsMissingFile { return false }
+                        throw ICloudDriveFileMemoryError.removePreconditionFailed
+                    }
                     defer { close(parent) }
                     let name = path.name!
-                    guard let information = try fileInformation(
+                    guard let initialInformation = try fileInformation(
                         parentDescriptor: parent,
                         name: name,
                         path: path
                     ) else {
-                        if case .ifExists = mode { return false }
+                        if policy.allowsMissingFile { return false }
                         throw ICloudDriveFileMemoryError.removePreconditionFailed
                     }
                     try coordinatedItemValidator(coordinatedURL)
-                    if case .ifUnmodified(let expected) = mode,
-                       modificationDate(information) != expected {
+
+                    // Coordination serializes participating presenters. The
+                    // descriptor-rooted full-snapshot recheck also detects a
+                    // local mutation or replacement observed while coordinated
+                    // validation runs, even when it restores the expected mtime.
+                    guard let currentInformation = try fileInformation(
+                        parentDescriptor: parent,
+                        name: name,
+                        path: path
+                    ) else {
+                        if policy.allowsMissingFile { return false }
+                        throw ICloudDriveFileMemoryError.removePreconditionFailed
+                    }
+                    guard representsSameSnapshot(initialInformation, currentInformation) else {
+                        throw ICloudDriveFileMemoryError.removePreconditionFailed
+                    }
+                    if let expected = policy.expectedModificationDate,
+                       modificationDate(currentInformation) != expected {
                         throw ICloudDriveFileMemoryError.removePreconditionFailed
                     }
                     let status = name.withCString { unlinkat(parent, $0, 0) }
                     if status != 0 {
-                        if errno == ENOENT, case .ifExists = mode { return false }
+                        if errno == ENOENT, policy.allowsMissingFile { return false }
                         throw ICloudDriveFileMemoryError.coordinatedRemoveFailed
                     }
                     return true
@@ -983,11 +1081,17 @@ public actor ICloudDriveFileMemoryAccess: FileMemoryFileAccess {
                     guard coordinatedURL.standardizedFileURL == parentURL.standardizedFileURL else {
                         throw ICloudDriveFileMemoryError.containerChangedDuringOperation
                     }
-                    let parent = try openDirectory(
-                        rootURL: rootURL,
-                        relativeComponents: path.parent?.components ?? [],
-                        createMissing: false
-                    )
+                    let parent: Int32
+                    do {
+                        parent = try openDirectory(
+                            rootURL: rootURL,
+                            relativeComponents: path.parent?.components ?? [],
+                            createMissing: false,
+                            missingIntermediateIsAbsent: true
+                        )
+                    } catch ICloudDriveDescriptorTraversalError.missingIntermediateDirectory {
+                        return false
+                    }
                     defer { close(parent) }
                     return try fileInformation(
                         parentDescriptor: parent,
@@ -1019,7 +1123,8 @@ public actor ICloudDriveFileMemoryAccess: FileMemoryFileAccess {
     private static func openDirectory(
         rootURL: URL,
         relativeComponents: [String],
-        createMissing: Bool
+        createMissing: Bool,
+        missingIntermediateIsAbsent: Bool = false
     ) throws -> Int32 {
         var before = stat()
         guard lstat(rootURL.path, &before) == 0 else {
@@ -1081,6 +1186,9 @@ public actor ICloudDriveFileMemoryAccess: FileMemoryFileAccess {
             guard next >= 0 else {
                 let failure = errno
                 close(descriptor)
+                if failure == ENOENT, missingIntermediateIsAbsent {
+                    throw ICloudDriveDescriptorTraversalError.missingIntermediateDirectory
+                }
                 if failure == ELOOP || failure == ENOTDIR {
                     throw ICloudDriveFileMemoryError.symbolicLinkNotAllowed
                 }

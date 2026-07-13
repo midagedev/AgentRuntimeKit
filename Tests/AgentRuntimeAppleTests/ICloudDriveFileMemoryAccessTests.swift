@@ -376,7 +376,10 @@ final class ICloudDriveFileMemoryAccessTests: XCTestCase {
             XCTAssertEqual(error, .itemNotCurrent)
         }
         do {
-            _ = try await access.removeFile(at: path, mode: .ifExists)
+            _ = try await access.removeFileIfPresent(
+                at: path,
+                matchingModifiedAt: .distantPast
+            )
             XCTFail("Expected the in-coordinator current-version check to fail")
         } catch let error as ICloudDriveFileMemoryError {
             XCTAssertEqual(error, .itemNotCurrent)
@@ -482,7 +485,340 @@ final class ICloudDriveFileMemoryAccessTests: XCTestCase {
         XCTAssertFalse(removedAgain)
     }
 
-    func testMissingRetryableRemovalStillChecksContainerIdentity() async throws {
+    func testConditionalRetryableRemovalReturnsFalseWhenFileIsMissing() async throws {
+        let temporary = try ICloudTemporaryDirectory()
+        let container = temporary.url.appendingPathComponent("container", isDirectory: true)
+        try FileManager.default.createDirectory(at: container, withIntermediateDirectories: true)
+        let access = try makeAccess(containerURL: container)
+
+        let removed = try await access.removeFileIfPresent(
+            at: try FileMemoryPath("missing.md"),
+            matchingModifiedAt: .distantPast
+        )
+
+        XCTAssertFalse(removed)
+    }
+
+    func testConditionalRetryableRemovalReturnsFalseWhenParentIsMissing() async throws {
+        let temporary = try ICloudTemporaryDirectory()
+        let container = temporary.url.appendingPathComponent("container", isDirectory: true)
+        try FileManager.default.createDirectory(at: container, withIntermediateDirectories: true)
+        let access = try makeAccess(containerURL: container)
+
+        let removed = try await access.removeFileIfPresent(
+            at: try FileMemoryPath("missing/subdirectory/note.md"),
+            matchingModifiedAt: .distantPast
+        )
+
+        XCTAssertFalse(removed)
+    }
+
+    func testConditionalRetryableRemovalDeletesMatchingFile() async throws {
+        let temporary = try ICloudTemporaryDirectory()
+        let container = try prepareFile(
+            in: temporary.url,
+            relativePath: "managed/note.md",
+            contents: "managed"
+        )
+        let access = try makeAccess(containerURL: container)
+        let path = try FileMemoryPath("managed/note.md")
+        let listed = try await access.listDirectory(
+            at: try FileMemoryPath("managed"),
+            maximumEntryCount: 10
+        )
+        let modifiedAt = try XCTUnwrap(listed.first?.modifiedAt)
+
+        let removed = try await access.removeFileIfPresent(
+            at: path,
+            matchingModifiedAt: modifiedAt
+        )
+
+        XCTAssertTrue(removed)
+        let target = container.appendingPathComponent("Documents/AgentMemory/managed/note.md")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+    }
+
+    func testConditionalRetryableRemovalRejectsModificationDateMismatch() async throws {
+        let temporary = try ICloudTemporaryDirectory()
+        let container = try prepareFile(
+            in: temporary.url,
+            relativePath: "managed/note.md",
+            contents: "managed"
+        )
+        let access = try makeAccess(containerURL: container)
+        let path = try FileMemoryPath("managed/note.md")
+
+        do {
+            _ = try await access.removeFileIfPresent(
+                at: path,
+                matchingModifiedAt: .distantPast
+            )
+            XCTFail("Expected stale removal precondition")
+        } catch let error as ICloudDriveFileMemoryError {
+            XCTAssertEqual(error, .removePreconditionFailed)
+        }
+
+        let target = container.appendingPathComponent("Documents/AgentMemory/managed/note.md")
+        XCTAssertEqual(String(data: try Data(contentsOf: target), encoding: .utf8), "managed")
+    }
+
+    func testConditionalRetryableRemovalIsIdempotentAfterSuccessfulDelete() async throws {
+        let temporary = try ICloudTemporaryDirectory()
+        let container = try prepareFile(
+            in: temporary.url,
+            relativePath: "managed/note.md",
+            contents: "managed"
+        )
+        let access = try makeAccess(containerURL: container)
+        let path = try FileMemoryPath("managed/note.md")
+        let listed = try await access.listDirectory(
+            at: try FileMemoryPath("managed"),
+            maximumEntryCount: 10
+        )
+        let modifiedAt = try XCTUnwrap(listed.first?.modifiedAt)
+        let first = try await access.removeFileIfPresent(
+            at: path,
+            matchingModifiedAt: modifiedAt
+        )
+        // Models a process crash after deletion but before its cleanup journal
+        // records success: a new access instance can safely replay the request.
+        let retryAccess = try makeAccess(containerURL: container)
+        let retry = try await retryAccess.removeFileIfPresent(
+            at: path,
+            matchingModifiedAt: modifiedAt
+        )
+
+        XCTAssertTrue(first)
+        XCTAssertFalse(retry)
+    }
+
+    func testConcurrentConditionalRetryableRemovalsDeleteAtMostOnce() async throws {
+        let temporary = try ICloudTemporaryDirectory()
+        let container = try prepareFile(
+            in: temporary.url,
+            relativePath: "managed/note.md",
+            contents: "managed"
+        )
+        let access = try makeAccess(containerURL: container)
+        let path = try FileMemoryPath("managed/note.md")
+        let listed = try await access.listDirectory(
+            at: try FileMemoryPath("managed"),
+            maximumEntryCount: 10
+        )
+        let modifiedAt = try XCTUnwrap(listed.first?.modifiedAt)
+        async let first = access.removeFileIfPresent(
+            at: path,
+            matchingModifiedAt: modifiedAt
+        )
+        async let second = access.removeFileIfPresent(
+            at: path,
+            matchingModifiedAt: modifiedAt
+        )
+        let results = try await [first, second]
+
+        XCTAssertEqual(results.filter(\.self).count, 1)
+    }
+
+    func testConditionalRetryableRemovalHandlesDisappearanceInsideCoordination() async throws {
+        let temporary = try ICloudTemporaryDirectory()
+        let container = try prepareFile(
+            in: temporary.url,
+            relativePath: "managed/note.md",
+            contents: "managed"
+        )
+        let path = try FileMemoryPath("managed/note.md")
+        let listingAccess = try makeAccess(containerURL: container)
+        let listed = try await listingAccess.listDirectory(
+            at: try FileMemoryPath("managed"),
+            maximumEntryCount: 10
+        )
+        let modifiedAt = try XCTUnwrap(listed.first?.modifiedAt)
+        let access = try makeAccess(
+            containerURL: container,
+            coordinatedItemValidator: { url in
+                try FileManager.default.removeItem(at: url)
+            }
+        )
+
+        let removed = try await access.removeFileIfPresent(
+            at: path,
+            matchingModifiedAt: modifiedAt
+        )
+
+        XCTAssertFalse(removed)
+    }
+
+    func testConditionalRetryableRemovalHandlesDisappearanceBeforeMetadataRead() async throws {
+        let temporary = try ICloudTemporaryDirectory()
+        let container = try prepareFile(
+            in: temporary.url,
+            relativePath: "managed/note.md",
+            contents: "managed"
+        )
+        let access = try makeAccess(
+            containerURL: container,
+            itemManager: RemovingICloudItemManager()
+        )
+
+        let removed = try await access.removeFileIfPresent(
+            at: try FileMemoryPath("managed/note.md"),
+            matchingModifiedAt: .distantPast
+        )
+
+        XCTAssertFalse(removed)
+    }
+
+    func testConditionalRetryableRemovalDoesNotHideDownloadFailureForExistingFile() async throws {
+        let temporary = try ICloudTemporaryDirectory()
+        let container = try prepareFile(
+            in: temporary.url,
+            relativePath: "managed/note.md",
+            contents: "managed"
+        )
+        let itemManager = FakeICloudItemManager(
+            states: [.init(downloadStatus: .failed)],
+            repeatsLastState: true
+        )
+        let access = try makeAccess(containerURL: container, itemManager: itemManager)
+
+        do {
+            _ = try await access.removeFileIfPresent(
+                at: try FileMemoryPath("managed/note.md"),
+                matchingModifiedAt: .distantPast
+            )
+            XCTFail("Expected download failure for a still-present file")
+        } catch let error as ICloudDriveFileMemoryError {
+            XCTAssertEqual(error, .downloadFailed)
+        }
+
+        let target = container.appendingPathComponent("Documents/AgentMemory/managed/note.md")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: target.path))
+    }
+
+    func testConditionalRetryableRemovalRejectsReplacementIdentityWithSameMTime() async throws {
+        let temporary = try ICloudTemporaryDirectory()
+        let container = try prepareFile(
+            in: temporary.url,
+            relativePath: "managed/note.md",
+            contents: "managed"
+        )
+        let path = try FileMemoryPath("managed/note.md")
+        let listingAccess = try makeAccess(containerURL: container)
+        let listed = try await listingAccess.listDirectory(
+            at: try FileMemoryPath("managed"),
+            maximumEntryCount: 10
+        )
+        let modifiedAt = try XCTUnwrap(listed.first?.modifiedAt)
+        let replacement = container.appendingPathComponent(
+            "Documents/AgentMemory/managed/replacement.md"
+        )
+        try Data("replacement".utf8).write(to: replacement)
+        try FileManager.default.setAttributes(
+            [.modificationDate: modifiedAt],
+            ofItemAtPath: replacement.path
+        )
+        let access = try makeAccess(
+            containerURL: container,
+            coordinatedItemValidator: { url in
+                _ = try FileManager.default.replaceItemAt(
+                    url,
+                    withItemAt: replacement,
+                    backupItemName: nil,
+                    options: .usingNewMetadataOnly
+                )
+            }
+        )
+
+        do {
+            _ = try await access.removeFileIfPresent(
+                at: path,
+                matchingModifiedAt: modifiedAt
+            )
+            XCTFail("Expected replacement identity to fail closed")
+        } catch let error as ICloudDriveFileMemoryError {
+            XCTAssertEqual(error, .removePreconditionFailed)
+        }
+
+        let target = container.appendingPathComponent("Documents/AgentMemory/managed/note.md")
+        XCTAssertEqual(String(data: try Data(contentsOf: target), encoding: .utf8), "replacement")
+    }
+
+    func testConditionalRetryableRemovalRejectsInPlaceMutationWithRestoredMTime() async throws {
+        let temporary = try ICloudTemporaryDirectory()
+        let container = try prepareFile(
+            in: temporary.url,
+            relativePath: "managed/note.md",
+            contents: "managed"
+        )
+        let path = try FileMemoryPath("managed/note.md")
+        let listingAccess = try makeAccess(containerURL: container)
+        let listed = try await listingAccess.listDirectory(
+            at: try FileMemoryPath("managed"),
+            maximumEntryCount: 10
+        )
+        let modifiedAt = try XCTUnwrap(listed.first?.modifiedAt)
+        let access = try makeAccess(
+            containerURL: container,
+            coordinatedItemValidator: { url in
+                let handle = try FileHandle(forWritingTo: url)
+                try handle.truncate(atOffset: 0)
+                try handle.write(contentsOf: Data("mutated-content".utf8))
+                try handle.synchronize()
+                try handle.close()
+                try FileManager.default.setAttributes(
+                    [.modificationDate: modifiedAt],
+                    ofItemAtPath: url.path
+                )
+            }
+        )
+
+        do {
+            _ = try await access.removeFileIfPresent(
+                at: path,
+                matchingModifiedAt: modifiedAt
+            )
+            XCTFail("Expected in-place mutation to fail closed")
+        } catch let error as ICloudDriveFileMemoryError {
+            XCTAssertEqual(error, .removePreconditionFailed)
+        }
+
+        let target = container.appendingPathComponent("Documents/AgentMemory/managed/note.md")
+        XCTAssertEqual(
+            String(data: try Data(contentsOf: target), encoding: .utf8),
+            "mutated-content"
+        )
+    }
+
+    func testConditionalRetryableRemovalFailsClosedForUnresolvedVersion() async throws {
+        let temporary = try ICloudTemporaryDirectory()
+        let container = try prepareFile(
+            in: temporary.url,
+            relativePath: "managed/note.md",
+            contents: "managed"
+        )
+        let itemManager = FakeICloudItemManager(
+            states: [
+                ICloudDriveItemState(
+                    downloadStatus: .current,
+                    hasUnresolvedConflicts: true
+                ),
+            ],
+            repeatsLastState: true
+        )
+        let access = try makeAccess(containerURL: container, itemManager: itemManager)
+
+        do {
+            _ = try await access.removeFileIfPresent(
+                at: try FileMemoryPath("managed/note.md"),
+                matchingModifiedAt: .distantPast
+            )
+            XCTFail("Expected unresolved-version failure")
+        } catch let error as ICloudDriveFileMemoryError {
+            XCTAssertEqual(error, .unresolvedVersionConflict)
+        }
+    }
+
+    func testMissingConditionalRetryableRemovalStillChecksContainerIdentity() async throws {
         let temporary = try ICloudTemporaryDirectory()
         let container = temporary.url.appendingPathComponent("container", isDirectory: true)
         try FileManager.default.createDirectory(at: container, withIntermediateDirectories: true)
@@ -506,14 +842,106 @@ final class ICloudDriveFileMemoryAccessTests: XCTestCase {
         let access = try makeAccess(containerURL: container, locator: locator)
 
         do {
-            _ = try await access.removeFile(
+            _ = try await access.removeFileIfPresent(
                 at: try FileMemoryPath("missing.md"),
-                mode: .ifExists
+                matchingModifiedAt: .distantPast
             )
             XCTFail("Expected identity change to invalidate the missing result")
         } catch let error as ICloudDriveFileMemoryError {
             XCTAssertEqual(error, .containerChangedDuringOperation)
         }
+    }
+
+    func testConditionalRetryableRemovalChecksIdentityBeforeMutation() async throws {
+        let temporary = try ICloudTemporaryDirectory()
+        let container = try prepareFile(
+            in: temporary.url,
+            relativePath: "managed/note.md",
+            contents: "managed"
+        )
+        let listingAccess = try makeAccess(containerURL: container)
+        let listed = try await listingAccess.listDirectory(
+            at: try FileMemoryPath("managed"),
+            maximumEntryCount: 10
+        )
+        let modifiedAt = try XCTUnwrap(listed.first?.modifiedAt)
+        let initial = ICloudDriveContainerLocation(
+            containerURL: container,
+            identityGeneration: 1
+        )
+        let changed = ICloudDriveContainerLocation(
+            containerURL: container,
+            identityGeneration: 2
+        )
+        let locator = FakeICloudContainerLocator(
+            locations: [initial, initial, changed],
+            repeatsLastLocation: true
+        )
+        let access = try makeAccess(containerURL: container, locator: locator)
+
+        do {
+            _ = try await access.removeFileIfPresent(
+                at: try FileMemoryPath("managed/note.md"),
+                matchingModifiedAt: modifiedAt
+            )
+            XCTFail("Expected pre-mutation identity fence")
+        } catch let error as ICloudDriveFileMemoryError {
+            XCTAssertEqual(error, .containerChangedDuringOperation)
+        }
+
+        let target = container.appendingPathComponent("Documents/AgentMemory/managed/note.md")
+        XCTAssertEqual(String(data: try Data(contentsOf: target), encoding: .utf8), "managed")
+    }
+
+    func testConditionalRetryableRemovalCanRetryAfterPostMutationIdentityFailure() async throws {
+        let temporary = try ICloudTemporaryDirectory()
+        let container = try prepareFile(
+            in: temporary.url,
+            relativePath: "managed/note.md",
+            contents: "managed"
+        )
+        let listingAccess = try makeAccess(containerURL: container)
+        let listed = try await listingAccess.listDirectory(
+            at: try FileMemoryPath("managed"),
+            maximumEntryCount: 10
+        )
+        let modifiedAt = try XCTUnwrap(listed.first?.modifiedAt)
+        let initial = ICloudDriveContainerLocation(
+            containerURL: container,
+            identityGeneration: 1
+        )
+        let changed = ICloudDriveContainerLocation(
+            containerURL: container,
+            identityGeneration: 2
+        )
+        let locator = FakeICloudContainerLocator(
+            locations: [initial, initial, initial, changed],
+            repeatsLastLocation: true
+        )
+        let access = try makeAccess(containerURL: container, locator: locator)
+        let path = try FileMemoryPath("managed/note.md")
+
+        do {
+            _ = try await access.removeFileIfPresent(
+                at: path,
+                matchingModifiedAt: modifiedAt
+            )
+            XCTFail("Expected post-mutation identity fence")
+        } catch let error as ICloudDriveFileMemoryError {
+            XCTAssertEqual(error, .containerChangedDuringOperation)
+        }
+
+        let target = container.appendingPathComponent("Documents/AgentMemory/managed/note.md")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+        // Return to the originally observed stable container before replaying
+        // the cleanup request; an observed date is not portable across iCloud
+        // identity generations.
+        let retryAccess = try makeAccess(containerURL: container)
+        let retry = try await retryAccess.removeFileIfPresent(
+            at: path,
+            matchingModifiedAt: modifiedAt
+        )
+        XCTAssertFalse(retry)
     }
 
     func testFinalSymlinkCannotRedirectWriteOrRemoval() async throws {
@@ -537,7 +965,10 @@ final class ICloudDriveFileMemoryAccessTests: XCTestCase {
             XCTAssertEqual(error, .symbolicLink(path))
         }
         do {
-            _ = try await access.removeFile(at: path)
+            _ = try await access.removeFileIfPresent(
+                at: path,
+                matchingModifiedAt: .distantPast
+            )
             XCTFail("Expected final symlink rejection")
         } catch let error as FileMemoryError {
             XCTAssertEqual(error, .symbolicLink(path))
@@ -828,6 +1259,15 @@ private actor FakeICloudItemManager: ICloudDriveItemManaging {
     func startDownloadingItem(at url: URL) {
         downloadRequestCount += 1
     }
+}
+
+private actor RemovingICloudItemManager: ICloudDriveItemManaging {
+    func state(of url: URL) throws -> ICloudDriveItemState {
+        try FileManager.default.removeItem(at: url)
+        throw ICloudDriveFileMemoryError.downloadFailed
+    }
+
+    func startDownloadingItem(at url: URL) {}
 }
 
 private final class ICloudTemporaryDirectory {

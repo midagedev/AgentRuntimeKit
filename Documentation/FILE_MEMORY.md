@@ -112,6 +112,30 @@ semantics. Removal is limited to a regular root-relative file and supports
 idempotent or modification-date-preconditioned cleanup. Existing ubiquitous
 items must be current and conflict-free before a write or removal proceeds.
 
+AgentRuntimeKit 0.2.1 adds a retry-safe conditional removal for cleanup journals:
+
+```swift
+let removed = try await cloud.removeFileIfPresent(
+    at: generatedDocumentPath,
+    matchingModifiedAt: lastPublishedModificationDate
+)
+```
+
+The result is `true` only when that matching file was deleted. It is `false` if
+the file is already absent, including a retry after deletion succeeded but the
+host crashed before committing its journal. An existing file with a different
+modification date, or a snapshot/identity change observed during coordinated
+removal, fails with
+`ICloudDriveFileMemoryError.removePreconditionFailed`; symbolic links,
+non-current items, unresolved versions, and container identity changes keep
+their typed fail-closed errors. Do not replace this API with `ifExists` for
+user-editable or cross-device files: `ICloudDriveRemoveMode.ifExists`
+intentionally has no modification-date precondition. The observed `Date` is not
+an account-bound `NSFileVersion` token. After an iCloud identity or
+container-change error, throw it away and obtain a new value from a fresh
+coordinated read or listing rather than replaying it against a different
+account.
+
 iCloud selection should be explicit and reversible in the host UI. If the user
 is signed out, the entitlement is missing, or the container cannot be resolved,
 the adapter returns an error and does not use a local fallback. This avoids two
