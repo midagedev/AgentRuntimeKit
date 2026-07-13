@@ -11,9 +11,9 @@ Apple app one bounded execution model for streaming LLMs, native tools, user
 approval, scoped memory, Keychain credentials, checkpoints, audit records, and
 optional remote MCP tools.
 
-AgentRuntimeKit intentionally contains no SwiftUI. Dochi and YKPT are the first
-two host applications and keep their own domain models, interfaces, and consent
-flows.
+AgentRuntimeKit intentionally contains no SwiftUI or product-specific domain
+model. Host applications keep ownership of their interfaces, business rules,
+consent flows, and side effects.
 
 The package is designed for apps that need more than a chat completion wrapper:
 provider-owned reasoning continuation, bounded native tool execution, explicit
@@ -28,13 +28,13 @@ Add the package URL in Xcode:
 https://github.com/midagedev/AgentRuntimeKit.git
 ```
 
-Choose a version requirement starting at `0.1.0`, then add only the products
+Choose a version requirement starting at `0.1.1`, then add only the products
 your target needs. SwiftPM consumers can declare:
 
 ```swift
 .package(
     url: "https://github.com/midagedev/AgentRuntimeKit.git",
-    from: "0.1.0"
+    from: "0.1.1"
 )
 ```
 
@@ -96,7 +96,7 @@ let request = AgentRunRequest(
     appID: "com.example.myapp",
     userID: userID,
     agent: AgentDefinition(
-        id: "coach",
+        id: "assistant",
         providerID: "anthropic",
         model: model,
         instructions: systemPrompt,
@@ -142,6 +142,11 @@ application-wide, and instruction memories require explicit approval. HealthKit
 or similarly sensitive source data should normally be supplied as ephemeral
 context rather than written to long-term memory. Context and system instructions
 are composed only for provider requests; they never enter run results or checkpoints.
+
+The built-in persistent memory backend is SQLite. Version 0.1.x does not yet
+ship a Markdown/JSON directory codec, file watcher, or bidirectional file
+reconciliation layer; passing file contents through a custom context provider is
+not equivalent to managed file-based memory.
 
 `delete` is a recoverable status transition. User-facing privacy deletion uses
 the separate idempotent `purge(id:scope:)` or `purge(scopes:)` APIs, which remove

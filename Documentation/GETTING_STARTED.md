@@ -11,7 +11,7 @@ In Xcode, add:
 https://github.com/midagedev/AgentRuntimeKit.git
 ```
 
-Use a semantic version requirement starting at `0.1.0`. Select
+Use a semantic version requirement starting at `0.1.1`. Select
 `AgentRuntimeCore` and the provider, memory, Apple, or MCP products required by
 your app.
 
