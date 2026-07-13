@@ -1,5 +1,6 @@
 #if os(iOS) || os(macOS)
 import AgentRuntimeFileMemory
+import CryptoKit
 import Darwin
 import Foundation
 
@@ -67,6 +68,27 @@ public enum ICloudDriveFileMemoryError: Error, Sendable, Equatable, LocalizedErr
     }
 }
 
+/// Content-free validation failures for digest-bound iCloud Drive removal.
+///
+/// This separate additive error type preserves exhaustive switches over the
+/// existing ``ICloudDriveFileMemoryError`` cases in source clients.
+public enum ICloudDriveDigestRemovalError: Error, Sendable, Equatable, LocalizedError {
+    case invalidExpectedSHA256
+    case invalidMaximumByteCount
+    case fileTooLarge(limit: Int)
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidExpectedSHA256:
+            "The expected SHA-256 digest must be 64 lowercase hexadecimal characters."
+        case .invalidMaximumByteCount:
+            "The digest verification byte limit must be positive."
+        case .fileTooLarge(let limit):
+            "The iCloud Drive item exceeds the configured \(limit)-byte digest verification limit."
+        }
+    }
+}
+
 /// An explicit overwrite policy for app-authored iCloud Drive files.
 public enum ICloudDriveWriteMode: Sendable, Equatable {
     /// The destination must not exist.
@@ -94,13 +116,24 @@ public enum ICloudDriveRemoveMode: Sendable, Equatable {
     case ifUnmodified(modifiedAt: Date)
 }
 
+private struct ICloudDriveRemovalDigestRequirement: Sendable {
+    var expectedSHA256: [UInt8]
+    var maximumByteCount: Int
+}
+
 private enum ICloudDriveRemovalPolicy: Sendable {
     case mode(ICloudDriveRemoveMode)
     case ifPresentAndUnmodified(modifiedAt: Date)
+    case ifPresentAndUnmodifiedWithDigest(
+        modifiedAt: Date,
+        digest: ICloudDriveRemovalDigestRequirement
+    )
 
     var allowsMissingFile: Bool {
         switch self {
-        case .mode(.ifExists), .ifPresentAndUnmodified:
+        case .mode(.ifExists),
+             .ifPresentAndUnmodified,
+             .ifPresentAndUnmodifiedWithDigest:
             true
         case .mode(.requireExisting), .mode(.ifUnmodified):
             false
@@ -110,16 +143,25 @@ private enum ICloudDriveRemovalPolicy: Sendable {
     var expectedModificationDate: Date? {
         switch self {
         case .mode(.ifUnmodified(let modifiedAt)),
-             .ifPresentAndUnmodified(let modifiedAt):
+             .ifPresentAndUnmodified(let modifiedAt),
+             .ifPresentAndUnmodifiedWithDigest(let modifiedAt, _):
             modifiedAt
         case .mode(.ifExists), .mode(.requireExisting):
             nil
         }
     }
+
+    var digestRequirement: ICloudDriveRemovalDigestRequirement? {
+        guard case .ifPresentAndUnmodifiedWithDigest(_, let digest) = self else {
+            return nil
+        }
+        return digest
+    }
 }
 
 private enum ICloudDriveDescriptorTraversalError: Error {
     case missingIntermediateDirectory
+    case missingLeaf
 }
 
 /// One entitlement-scoped iCloud container lookup.
@@ -498,6 +540,42 @@ public actor ICloudDriveFileMemoryAccess: FileMemoryFileAccess {
         try await removeFile(
             at: path,
             policy: .ifPresentAndUnmodified(modifiedAt: modifiedAt)
+        )
+    }
+
+    /// Removes an app-owned regular file only when its current coordinated
+    /// modification date and SHA-256 digest both match values from the caller's
+    /// preceding bounded read.
+    ///
+    /// Digest verification is performed with descriptor-rooted, `O_NOFOLLOW`
+    /// access inside the deletion coordination. The read never exceeds
+    /// `maximumByteCount` plus the single byte needed to detect growth beyond the
+    /// limit. A missing file remains an idempotent `false` result. Invalid inputs
+    /// and oversized files throw ``ICloudDriveDigestRemovalError``; a digest,
+    /// date, snapshot, or identity mismatch throws
+    /// ``ICloudDriveFileMemoryError/removePreconditionFailed``. Caller
+    /// cancellation is forwarded to the coordinated worker and checked while
+    /// hashing and immediately before unlinking.
+    @discardableResult
+    public func removeFileIfPresent(
+        at path: FileMemoryPath,
+        matchingModifiedAt modifiedAt: Date,
+        matchingSHA256 expectedSHA256: String,
+        maximumByteCount: Int
+    ) async throws -> Bool {
+        guard maximumByteCount > 0 else {
+            throw ICloudDriveDigestRemovalError.invalidMaximumByteCount
+        }
+        let digest = try Self.validatedSHA256Digest(expectedSHA256)
+        return try await removeFile(
+            at: path,
+            policy: .ifPresentAndUnmodifiedWithDigest(
+                modifiedAt: modifiedAt,
+                digest: ICloudDriveRemovalDigestRequirement(
+                    expectedSHA256: digest,
+                    maximumByteCount: maximumByteCount
+                )
+            )
         )
     }
 
@@ -978,7 +1056,7 @@ public actor ICloudDriveFileMemoryAccess: FileMemoryFileAccess {
         policy: ICloudDriveRemovalPolicy,
         coordinatedItemValidator: @escaping @Sendable (URL) throws -> Void
     ) async throws -> Bool {
-        try await Task.detached {
+        let operation = Task.detached {
             var coordinationError: NSError?
             var result: Result<Bool, any Error>?
             NSFileCoordinator().coordinate(
@@ -987,6 +1065,7 @@ public actor ICloudDriveFileMemoryAccess: FileMemoryFileAccess {
                 error: &coordinationError
             ) { coordinatedURL in
                 result = Result {
+                    try Task.checkCancellation()
                     guard coordinatedURL.standardizedFileURL == url.standardizedFileURL else {
                         throw ICloudDriveFileMemoryError.containerChangedDuringOperation
                     }
@@ -1038,6 +1117,43 @@ public actor ICloudDriveFileMemoryAccess: FileMemoryFileAccess {
                        modificationDate(currentInformation) != expected {
                         throw ICloudDriveFileMemoryError.removePreconditionFailed
                     }
+
+                    let verifiedInformation: stat
+                    if let digest = policy.digestRequirement {
+                        do {
+                            verifiedInformation = try verifyFileDigest(
+                                parentDescriptor: parent,
+                                name: name,
+                                path: path,
+                                baselineInformation: currentInformation,
+                                requirement: digest
+                            )
+                        } catch ICloudDriveDescriptorTraversalError.missingLeaf {
+                            if policy.allowsMissingFile { return false }
+                            throw ICloudDriveFileMemoryError.removePreconditionFailed
+                        }
+                    } else {
+                        verifiedInformation = currentInformation
+                    }
+
+                    // Revalidate the name immediately before unlink. A file
+                    // descriptor remains bound to its opened object if another
+                    // writer replaces the directory entry during hashing.
+                    guard let preUnlinkInformation = try fileInformation(
+                        parentDescriptor: parent,
+                        name: name,
+                        path: path
+                    ) else {
+                        if policy.allowsMissingFile { return false }
+                        throw ICloudDriveFileMemoryError.removePreconditionFailed
+                    }
+                    guard representsSameSnapshot(
+                        verifiedInformation,
+                        preUnlinkInformation
+                    ) else {
+                        throw ICloudDriveFileMemoryError.removePreconditionFailed
+                    }
+                    try Task.checkCancellation()
                     let status = name.withCString { unlinkat(parent, $0, 0) }
                     if status != 0 {
                         if errno == ENOENT, policy.allowsMissingFile { return false }
@@ -1060,7 +1176,12 @@ public actor ICloudDriveFileMemoryAccess: FileMemoryFileAccess {
                 throw ICloudDriveFileMemoryError.coordinatedRemoveFailed
             }
             throw ICloudDriveFileMemoryError.coordinatedRemoveFailed
-        }.value
+        }
+        return try await withTaskCancellationHandler {
+            try await operation.value
+        } onCancel: {
+            operation.cancel()
+        }
     }
 
     private static func coordinatedItemExists(
@@ -1222,6 +1343,88 @@ public actor ICloudDriveFileMemoryAccess: FileMemoryFileAccess {
         return information
     }
 
+    private static func verifyFileDigest(
+        parentDescriptor: Int32,
+        name: String,
+        path: FileMemoryPath,
+        baselineInformation: stat,
+        requirement: ICloudDriveRemovalDigestRequirement
+    ) throws -> stat {
+        let descriptor = name.withCString {
+            openat(parentDescriptor, $0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        }
+        guard descriptor >= 0 else {
+            switch errno {
+            case ENOENT:
+                throw ICloudDriveDescriptorTraversalError.missingLeaf
+            case ELOOP:
+                throw FileMemoryError.symbolicLink(path)
+            default:
+                throw FileMemoryError.accessDenied(path)
+            }
+        }
+        defer { close(descriptor) }
+
+        var initialInformation = stat()
+        guard fstat(descriptor, &initialInformation) == 0 else {
+            throw ICloudDriveFileMemoryError.coordinatedReadFailed
+        }
+        guard fileType(initialInformation.st_mode) == S_IFREG else {
+            throw FileMemoryError.notRegularFile(path)
+        }
+        guard representsSameSnapshot(baselineInformation, initialInformation) else {
+            throw ICloudDriveFileMemoryError.removePreconditionFailed
+        }
+        guard let expectedByteCount = nonnegativeInt(initialInformation.st_size),
+              expectedByteCount <= requirement.maximumByteCount else {
+            throw ICloudDriveDigestRemovalError.fileTooLarge(
+                limit: requirement.maximumByteCount
+            )
+        }
+
+        var hasher = SHA256()
+        var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
+        var totalByteCount = 0
+        while true {
+            try Task.checkCancellation()
+            let remaining = requirement.maximumByteCount - totalByteCount
+            let requestedByteCount = remaining >= buffer.count
+                ? buffer.count
+                : remaining + 1
+            let readByteCount = buffer.withUnsafeMutableBytes { rawBuffer in
+                Darwin.read(descriptor, rawBuffer.baseAddress, requestedByteCount)
+            }
+            if readByteCount < 0 {
+                if errno == EINTR { continue }
+                throw ICloudDriveFileMemoryError.coordinatedReadFailed
+            }
+            if readByteCount == 0 { break }
+            guard readByteCount <= remaining else {
+                throw ICloudDriveDigestRemovalError.fileTooLarge(
+                    limit: requirement.maximumByteCount
+                )
+            }
+            buffer.withUnsafeBytes { rawBuffer in
+                hasher.update(bufferPointer: UnsafeRawBufferPointer(
+                    start: rawBuffer.baseAddress,
+                    count: readByteCount
+                ))
+            }
+            totalByteCount += readByteCount
+        }
+
+        var finalInformation = stat()
+        guard fstat(descriptor, &finalInformation) == 0,
+              representsSameSnapshot(initialInformation, finalInformation),
+              totalByteCount == expectedByteCount else {
+            throw ICloudDriveFileMemoryError.removePreconditionFailed
+        }
+        guard Array(hasher.finalize()) == requirement.expectedSHA256 else {
+            throw ICloudDriveFileMemoryError.removePreconditionFailed
+        }
+        return finalInformation
+    }
+
     private static func atomicWrite(
         _ data: Data,
         parentDescriptor: Int32,
@@ -1348,6 +1551,38 @@ public actor ICloudDriveFileMemoryAccess: FileMemoryFileAccess {
         mode & mode_t(S_IFMT)
     }
 
+    private static func validatedSHA256Digest(_ value: String) throws -> [UInt8] {
+        let characters = value.utf8
+        // Inspect at most one byte beyond the accepted length. Oversized,
+        // attacker-controlled input is rejected without a full scan or copy.
+        guard characters.prefix(65).count == 64 else {
+            throw ICloudDriveDigestRemovalError.invalidExpectedSHA256
+        }
+        var iterator = characters.makeIterator()
+        var digest = [UInt8](repeating: 0, count: 32)
+        for index in digest.indices {
+            guard let highCharacter = iterator.next(),
+                  let lowCharacter = iterator.next(),
+                  let high = hexadecimalNibble(highCharacter),
+                  let low = hexadecimalNibble(lowCharacter) else {
+                throw ICloudDriveDigestRemovalError.invalidExpectedSHA256
+            }
+            digest[index] = (high << 4) | low
+        }
+        return digest
+    }
+
+    private static func hexadecimalNibble(_ character: UInt8) -> UInt8? {
+        switch character {
+        case 48...57:
+            character - 48
+        case 97...102:
+            character - 87
+        default:
+            nil
+        }
+    }
+
     private static func nonnegativeInt<T: BinaryInteger>(_ value: T) -> Int? {
         guard value >= 0, value <= T(Int.max) else { return nil }
         return Int(value)
@@ -1390,6 +1625,7 @@ public actor ICloudDriveFileMemoryAccess: FileMemoryFileAccess {
         fallback: ICloudDriveFileMemoryError
     ) -> any Error {
         if let error = error as? ICloudDriveFileMemoryError { return error }
+        if let error = error as? ICloudDriveDigestRemovalError { return error }
         if let error = error as? FileMemoryError { return error }
         if error is CancellationError { return CancellationError() }
         return fallback

@@ -1,6 +1,8 @@
 #if os(iOS) || os(macOS)
 @testable import AgentRuntimeApple
 import AgentRuntimeFileMemory
+import CryptoKit
+import Darwin
 import Foundation
 import XCTest
 
@@ -536,6 +538,363 @@ final class ICloudDriveFileMemoryAccessTests: XCTestCase {
         XCTAssertTrue(removed)
         let target = container.appendingPathComponent("Documents/AgentMemory/managed/note.md")
         XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+    }
+
+    func testDigestBoundRemovalDeletesMatchAndCrashRetryReturnsFalse() async throws {
+        let temporary = try ICloudTemporaryDirectory()
+        let contents = Data("original".utf8)
+        let container = try prepareFile(
+            in: temporary.url,
+            relativePath: "managed/note.md",
+            contents: "original"
+        )
+        let access = try makeAccess(containerURL: container)
+        let path = try FileMemoryPath("managed/note.md")
+        let read = try await access.readFile(at: path, maximumByteCount: 100)
+        let modifiedAt = try XCTUnwrap(read.modifiedAt)
+        let digest = sha256Hex(read.data)
+
+        let removed = try await access.removeFileIfPresent(
+            at: path,
+            matchingModifiedAt: modifiedAt,
+            matchingSHA256: digest,
+            maximumByteCount: contents.count
+        )
+        let retryAccess = try makeAccess(containerURL: container)
+        let retry = try await retryAccess.removeFileIfPresent(
+            at: path,
+            matchingModifiedAt: modifiedAt,
+            matchingSHA256: digest,
+            maximumByteCount: contents.count
+        )
+
+        XCTAssertTrue(removed)
+        XCTAssertFalse(retry)
+    }
+
+    func testDigestBoundRemovalPreservesFileOnDigestMismatch() async throws {
+        let temporary = try ICloudTemporaryDirectory()
+        let container = try prepareFile(
+            in: temporary.url,
+            relativePath: "managed/note.md",
+            contents: "original"
+        )
+        let access = try makeAccess(containerURL: container)
+        let path = try FileMemoryPath("managed/note.md")
+        let read = try await access.readFile(at: path, maximumByteCount: 100)
+        let modifiedAt = try XCTUnwrap(read.modifiedAt)
+
+        do {
+            _ = try await access.removeFileIfPresent(
+                at: path,
+                matchingModifiedAt: modifiedAt,
+                matchingSHA256: sha256Hex(Data("different".utf8)),
+                maximumByteCount: 100
+            )
+            XCTFail("Expected digest mismatch")
+        } catch let error as ICloudDriveFileMemoryError {
+            XCTAssertEqual(error, .removePreconditionFailed)
+        }
+
+        let target = container.appendingPathComponent("Documents/AgentMemory/managed/note.md")
+        XCTAssertEqual(try Data(contentsOf: target), Data("original".utf8))
+    }
+
+    func testDigestBoundRemovalRejectsSameSizeSameMTimeMutationAfterRead() async throws {
+        let temporary = try ICloudTemporaryDirectory()
+        let container = try prepareFile(
+            in: temporary.url,
+            relativePath: "managed/note.md",
+            contents: "original"
+        )
+        let access = try makeAccess(containerURL: container)
+        let path = try FileMemoryPath("managed/note.md")
+        let read = try await access.readFile(at: path, maximumByteCount: 100)
+        let modifiedAt = try XCTUnwrap(read.modifiedAt)
+        let originalDigest = sha256Hex(read.data)
+        let target = container.appendingPathComponent("Documents/AgentMemory/managed/note.md")
+        let mutation = Data("mutated!".utf8)
+        XCTAssertEqual(mutation.count, read.data.count)
+        try overwriteFileInPlacePreservingTimes(at: target, with: mutation)
+        let relisted = try await access.listDirectory(
+            at: try FileMemoryPath("managed"),
+            maximumEntryCount: 10
+        )
+        XCTAssertEqual(relisted.first?.modifiedAt, modifiedAt)
+        XCTAssertEqual(relisted.first?.byteCount, read.data.count)
+
+        do {
+            _ = try await access.removeFileIfPresent(
+                at: path,
+                matchingModifiedAt: modifiedAt,
+                matchingSHA256: originalDigest,
+                maximumByteCount: read.data.count
+            )
+            XCTFail("Expected digest-bound stale read rejection")
+        } catch let error as ICloudDriveFileMemoryError {
+            XCTAssertEqual(error, .removePreconditionFailed)
+        }
+
+        XCTAssertEqual(try Data(contentsOf: target), mutation)
+    }
+
+    func testDigestBoundRemovalRejectsMutationInsideCoordination() async throws {
+        let temporary = try ICloudTemporaryDirectory()
+        let container = try prepareFile(
+            in: temporary.url,
+            relativePath: "managed/note.md",
+            contents: "original"
+        )
+        let path = try FileMemoryPath("managed/note.md")
+        let readingAccess = try makeAccess(containerURL: container)
+        let read = try await readingAccess.readFile(at: path, maximumByteCount: 100)
+        let modifiedAt = try XCTUnwrap(read.modifiedAt)
+        let mutation = Data("mutated!".utf8)
+        let access = try makeAccess(
+            containerURL: container,
+            coordinatedItemValidator: { url in
+                try overwriteFileInPlacePreservingTimes(at: url, with: mutation)
+            }
+        )
+
+        do {
+            _ = try await access.removeFileIfPresent(
+                at: path,
+                matchingModifiedAt: modifiedAt,
+                matchingSHA256: sha256Hex(read.data),
+                maximumByteCount: read.data.count
+            )
+            XCTFail("Expected in-coordination mutation rejection")
+        } catch let error as ICloudDriveFileMemoryError {
+            XCTAssertEqual(error, .removePreconditionFailed)
+        }
+
+        let target = container.appendingPathComponent("Documents/AgentMemory/managed/note.md")
+        XCTAssertEqual(try Data(contentsOf: target), mutation)
+    }
+
+    func testDigestBoundRemovalRejectsReplacementInsideCoordination() async throws {
+        let temporary = try ICloudTemporaryDirectory()
+        let container = try prepareFile(
+            in: temporary.url,
+            relativePath: "managed/note.md",
+            contents: "original"
+        )
+        let path = try FileMemoryPath("managed/note.md")
+        let readingAccess = try makeAccess(containerURL: container)
+        let read = try await readingAccess.readFile(at: path, maximumByteCount: 100)
+        let modifiedAt = try XCTUnwrap(read.modifiedAt)
+        let replacement = container.appendingPathComponent(
+            "Documents/AgentMemory/managed/replacement.md"
+        )
+        let replacementData = Data("mutated!".utf8)
+        try replacementData.write(to: replacement)
+        try FileManager.default.setAttributes(
+            [.modificationDate: modifiedAt],
+            ofItemAtPath: replacement.path
+        )
+        let access = try makeAccess(
+            containerURL: container,
+            coordinatedItemValidator: { url in
+                _ = try FileManager.default.replaceItemAt(
+                    url,
+                    withItemAt: replacement,
+                    backupItemName: nil,
+                    options: .usingNewMetadataOnly
+                )
+            }
+        )
+
+        do {
+            _ = try await access.removeFileIfPresent(
+                at: path,
+                matchingModifiedAt: modifiedAt,
+                matchingSHA256: sha256Hex(read.data),
+                maximumByteCount: read.data.count
+            )
+            XCTFail("Expected in-coordination replacement rejection")
+        } catch let error as ICloudDriveFileMemoryError {
+            XCTAssertEqual(error, .removePreconditionFailed)
+        }
+
+        let target = container.appendingPathComponent("Documents/AgentMemory/managed/note.md")
+        XCTAssertEqual(try Data(contentsOf: target), replacementData)
+    }
+
+    func testDigestBoundRemovalRejectsOversizedFileWithoutReadingIt() async throws {
+        let temporary = try ICloudTemporaryDirectory()
+        let contents = Data("oversized".utf8)
+        let container = try prepareFile(
+            in: temporary.url,
+            relativePath: "managed/note.md",
+            contents: "oversized"
+        )
+        let access = try makeAccess(containerURL: container)
+        let path = try FileMemoryPath("managed/note.md")
+        let read = try await access.readFile(at: path, maximumByteCount: 100)
+        let modifiedAt = try XCTUnwrap(read.modifiedAt)
+        let limit = contents.count - 1
+
+        do {
+            _ = try await access.removeFileIfPresent(
+                at: path,
+                matchingModifiedAt: modifiedAt,
+                matchingSHA256: sha256Hex(contents),
+                maximumByteCount: limit
+            )
+            XCTFail("Expected digest verification size limit")
+        } catch let error as ICloudDriveDigestRemovalError {
+            XCTAssertEqual(error, .fileTooLarge(limit: limit))
+        }
+
+        let target = container.appendingPathComponent("Documents/AgentMemory/managed/note.md")
+        XCTAssertEqual(try Data(contentsOf: target), contents)
+    }
+
+    func testDigestBoundRemovalCancellationBeforeHashingPreservesLargeFile() async throws {
+        let temporary = try ICloudTemporaryDirectory()
+        let contents = Data(repeating: 0x61, count: 2 * 1_024 * 1_024)
+        let container = try prepareFile(
+            in: temporary.url,
+            relativePath: "managed/note.md",
+            contents: contents
+        )
+        let path = try FileMemoryPath("managed/note.md")
+        let readingAccess = try makeAccess(containerURL: container)
+        let read = try await readingAccess.readFile(
+            at: path,
+            maximumByteCount: contents.count
+        )
+        let modifiedAt = try XCTUnwrap(read.modifiedAt)
+        let gate = BlockingDigestVerificationGate()
+        let access = try makeAccess(
+            containerURL: container,
+            coordinatedItemValidator: { _ in
+                gate.blockImmediatelyBeforeDigestVerification()
+            }
+        )
+
+        let removal = Task {
+            try await access.removeFileIfPresent(
+                at: path,
+                matchingModifiedAt: modifiedAt,
+                matchingSHA256: sha256Hex(read.data),
+                maximumByteCount: contents.count
+            )
+        }
+        let reachedGate = await Task.detached {
+            gate.waitUntilBlocked()
+        }.value
+        removal.cancel()
+        gate.resumeDigestVerification()
+
+        XCTAssertTrue(reachedGate)
+        do {
+            _ = try await removal.value
+            XCTFail("Expected caller cancellation to stop digest-bound removal")
+        } catch is CancellationError {
+            // Expected. The detached coordinated operation must receive the
+            // caller's cancellation before it can hash or unlink the file.
+        }
+
+        let target = container.appendingPathComponent("Documents/AgentMemory/managed/note.md")
+        XCTAssertEqual(try Data(contentsOf: target), contents)
+    }
+
+    func testDigestBoundRemovalRejectsInvalidDigestBeforeContainerMutation() async throws {
+        let temporary = try ICloudTemporaryDirectory()
+        let container = temporary.url.appendingPathComponent("container", isDirectory: true)
+        try FileManager.default.createDirectory(at: container, withIntermediateDirectories: true)
+        let access = try makeAccess(containerURL: container)
+        let invalidDigests = [
+            "",
+            String(repeating: "0", count: 63),
+            String(repeating: "A", count: 64),
+            String(repeating: "g", count: 64),
+        ]
+
+        for digest in invalidDigests {
+            do {
+                _ = try await access.removeFileIfPresent(
+                    at: try FileMemoryPath("missing.md"),
+                    matchingModifiedAt: .distantPast,
+                    matchingSHA256: digest,
+                    maximumByteCount: 1
+                )
+                XCTFail("Expected invalid SHA-256 rejection")
+            } catch let error as ICloudDriveDigestRemovalError {
+                XCTAssertEqual(error, .invalidExpectedSHA256)
+            }
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: container.appendingPathComponent("Documents").path
+            )
+        )
+    }
+
+    func testDigestBoundRemovalRejectsInvalidLimitBeforeContainerMutation() async throws {
+        let temporary = try ICloudTemporaryDirectory()
+        let container = temporary.url.appendingPathComponent("container", isDirectory: true)
+        try FileManager.default.createDirectory(at: container, withIntermediateDirectories: true)
+        let access = try makeAccess(containerURL: container)
+        let digest = sha256Hex(Data())
+
+        for limit in [0, -1] {
+            do {
+                _ = try await access.removeFileIfPresent(
+                    at: try FileMemoryPath("missing.md"),
+                    matchingModifiedAt: .distantPast,
+                    matchingSHA256: digest,
+                    maximumByteCount: limit
+                )
+                XCTFail("Expected invalid digest verification limit")
+            } catch let error as ICloudDriveDigestRemovalError {
+                XCTAssertEqual(error, .invalidMaximumByteCount)
+            }
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: container.appendingPathComponent("Documents").path
+            )
+        )
+    }
+
+    func testDigestBoundRemovalRejectsVeryLongDigestBeforeContainerLookupOrMutation() async throws {
+        let temporary = try ICloudTemporaryDirectory()
+        let container = temporary.url.appendingPathComponent("container", isDirectory: true)
+        try FileManager.default.createDirectory(at: container, withIntermediateDirectories: true)
+        let locator = FakeICloudContainerLocator(
+            locations: [
+                ICloudDriveContainerLocation(
+                    containerURL: container,
+                    identityGeneration: 1
+                ),
+            ],
+            repeatsLastLocation: true
+        )
+        let access = try makeAccess(containerURL: container, locator: locator)
+        let invalidDigest = String(repeating: "a", count: 4 * 1_024 * 1_024)
+
+        do {
+            _ = try await access.removeFileIfPresent(
+                at: try FileMemoryPath("missing.md"),
+                matchingModifiedAt: .distantPast,
+                matchingSHA256: invalidDigest,
+                maximumByteCount: 1
+            )
+            XCTFail("Expected oversized digest input rejection")
+        } catch let error as ICloudDriveDigestRemovalError {
+            XCTAssertEqual(error, .invalidExpectedSHA256)
+        }
+
+        let locationRequestCount = await locator.locationRequestCount
+        XCTAssertEqual(locationRequestCount, 0)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: container.appendingPathComponent("Documents").path
+            )
+        )
     }
 
     func testConditionalRetryableRemovalRejectsModificationDateMismatch() async throws {
@@ -1166,6 +1525,18 @@ final class ICloudDriveFileMemoryAccessTests: XCTestCase {
         relativePath: String,
         contents: String
     ) throws -> URL {
+        try prepareFile(
+            in: temporaryURL,
+            relativePath: relativePath,
+            contents: Data(contents.utf8)
+        )
+    }
+
+    private func prepareFile(
+        in temporaryURL: URL,
+        relativePath: String,
+        contents: Data
+    ) throws -> URL {
         let container = temporaryURL.appendingPathComponent("container", isDirectory: true)
         let root = container.appendingPathComponent("Documents/AgentMemory", isDirectory: true)
         let file = root.appendingPathComponent(relativePath)
@@ -1173,8 +1544,34 @@ final class ICloudDriveFileMemoryAccessTests: XCTestCase {
             at: file.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        try Data(contents.utf8).write(to: file)
+        try contents.write(to: file)
         return container
+    }
+}
+
+private func sha256Hex(_ data: Data) -> String {
+    SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+
+private func overwriteFileInPlacePreservingTimes(
+    at url: URL,
+    with data: Data
+) throws {
+    var information = stat()
+    guard lstat(url.path, &information) == 0 else {
+        throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+    }
+    var timestamps = [information.st_atimespec, information.st_mtimespec]
+    let handle = try FileHandle(forWritingTo: url)
+    defer { try? handle.close() }
+    try handle.truncate(atOffset: 0)
+    try handle.write(contentsOf: data)
+    try handle.synchronize()
+    let status = timestamps.withUnsafeMutableBufferPointer {
+        futimens(handle.fileDescriptor, $0.baseAddress)
+    }
+    guard status == 0 else {
+        throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
     }
 }
 
@@ -1298,6 +1695,24 @@ private final class CancellationRecorder: @unchecked Sendable {
         lock.lock()
         storedCount += 1
         lock.unlock()
+    }
+}
+
+private final class BlockingDigestVerificationGate: @unchecked Sendable {
+    private let blocked = DispatchSemaphore(value: 0)
+    private let resume = DispatchSemaphore(value: 0)
+
+    func blockImmediatelyBeforeDigestVerification() {
+        blocked.signal()
+        resume.wait()
+    }
+
+    func waitUntilBlocked() -> Bool {
+        blocked.wait(timeout: .now() + .seconds(5)) == .success
+    }
+
+    func resumeDigestVerification() {
+        resume.signal()
     }
 }
 #endif
