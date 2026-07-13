@@ -83,6 +83,36 @@ public struct MemoryScope: Sendable, Codable, Hashable {
         guard !appID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw MemoryStoreError.invalidScope("appID must not be empty")
         }
+        for (value, field) in [
+            (Optional(appID), "appID"),
+            (userID, "userID"),
+            (agentID, "agentID"),
+            (workspaceID, "workspaceID"),
+            (sessionID, "sessionID"),
+        ] {
+            guard let value else { continue }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                throw MemoryStoreError.invalidScope("\(field) must not be empty")
+            }
+            guard value == trimmed else {
+                throw MemoryStoreError.invalidScope(
+                    "\(field) must not have leading or trailing whitespace"
+                )
+            }
+            guard value.utf8.elementsEqual(
+                value.precomposedStringWithCanonicalMapping.utf8
+            ) else {
+                throw MemoryStoreError.invalidScope("\(field) must use NFC Unicode normalization")
+            }
+            guard !value.unicodeScalars.contains(where: {
+                $0.value == 0 || CharacterSet.controlCharacters.contains($0)
+            }) else {
+                throw MemoryStoreError.invalidScope(
+                    "\(field) must not contain NUL or control characters"
+                )
+            }
+        }
         let required: String?
         let field: String
         switch level {
@@ -99,6 +129,64 @@ public struct MemoryScope: Sendable, Codable, Hashable {
         }
         guard let required, !required.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw MemoryStoreError.invalidScope("\(field) is required for a \(level.rawValue) scope")
+        }
+        return self
+    }
+
+    /// Accepts the safely recoverable, exact-byte subset of scopes written by
+    /// AgentRuntimeKit 0.1.x.
+    ///
+    /// SQLite read, update, and erasure operations use this compatibility
+    /// boundary so a legacy row with whitespace, non-NUL control characters,
+    /// or non-NFC identifiers never becomes unreachable after upgrade. NUL and
+    /// present-empty optionals are rejected here because 0.1.x stored them as
+    /// lossy aliases; explicit persisted-scope administration handles the
+    /// remaining non-canonical storage keys.
+    /// New proposals and source snapshots continue to use `validated()` and
+    /// therefore cannot create another non-canonical scope.
+    func validatedForLegacySQLiteAccess() throws -> Self {
+        guard !appID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw MemoryStoreError.invalidScope("appID must not be empty")
+        }
+        for (value, field) in [
+            (Optional(appID), "appID"),
+            (userID, "userID"),
+            (agentID, "agentID"),
+            (workspaceID, "workspaceID"),
+            (sessionID, "sessionID"),
+        ] {
+            guard let value else { continue }
+            guard !value.isEmpty else {
+                throw MemoryStoreError.invalidScope(
+                    "\(field) must not be an explicitly present empty identifier"
+                )
+            }
+            guard !value.utf8.contains(0) else {
+                throw MemoryStoreError.invalidScope(
+                    "\(field) must not contain NUL"
+                )
+            }
+        }
+        let required: String?
+        let field: String
+        switch level {
+        case .application:
+            return self
+        case .user:
+            (required, field) = (userID, "userID")
+        case .agent:
+            (required, field) = (agentID, "agentID")
+        case .workspace:
+            (required, field) = (workspaceID, "workspaceID")
+        case .session:
+            (required, field) = (sessionID, "sessionID")
+        }
+        guard let required,
+              !required.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            throw MemoryStoreError.invalidScope(
+                "\(field) is required for a \(level.rawValue) scope"
+            )
         }
         return self
     }
@@ -251,6 +339,48 @@ public struct MemoryRecord: Sendable, Codable, Hashable, Identifiable {
     public var createdAt: Date
     public var updatedAt: Date
 
+    /// Creates a fully materialized memory record.
+    ///
+    /// Custom `MemoryStore` implementations use this initializer when loading
+    /// their own durable representation. Stores are responsible for preserving
+    /// the record invariants documented by `MemoryStore` (including a positive
+    /// revision and an exact, validated scope).
+    public init(
+        id: UUID,
+        scope: MemoryScope,
+        kind: MemoryKind,
+        content: String,
+        sensitivity: AgentDataSensitivity,
+        provenance: MemoryProvenance,
+        confidence: Double,
+        importance: Double,
+        expiresAt: Date?,
+        revision: Int,
+        status: MemoryStatus,
+        deduplicationKey: String,
+        deduplicationKeyOrigin: MemoryDeduplicationKeyOrigin? = nil,
+        metadata: [String: JSONValue],
+        createdAt: Date,
+        updatedAt: Date
+    ) {
+        self.id = id
+        self.scope = scope
+        self.kind = kind
+        self.content = content
+        self.sensitivity = sensitivity
+        self.provenance = provenance
+        self.confidence = confidence
+        self.importance = importance
+        self.expiresAt = expiresAt
+        self.revision = revision
+        self.status = status
+        self.deduplicationKey = deduplicationKey
+        self.deduplicationKeyOrigin = deduplicationKeyOrigin
+        self.metadata = metadata
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+
     public var isExpired: Bool { isExpired(at: .now) }
 
     public func isExpired(at date: Date) -> Bool {
@@ -343,6 +473,18 @@ public struct MemorySearchHit: Sendable, Codable, Hashable, Identifiable {
     /// Budget-fitted text intended for direct use as model context.
     public var contextText: String
     public var isTruncated: Bool
+
+    public init(
+        record: MemoryRecord,
+        relevance: Double,
+        contextText: String,
+        isTruncated: Bool
+    ) {
+        self.record = record
+        self.relevance = relevance
+        self.contextText = contextText
+        self.isTruncated = isTruncated
+    }
 }
 
 public struct MemoryRetrievalResult: Sendable, Codable, Hashable {
@@ -350,6 +492,18 @@ public struct MemoryRetrievalResult: Sendable, Codable, Hashable {
     public var mode: MemorySearchMode
     public var usedCharacterCount: Int
     public var exhaustedBudget: Bool
+
+    public init(
+        hits: [MemorySearchHit],
+        mode: MemorySearchMode,
+        usedCharacterCount: Int,
+        exhaustedBudget: Bool
+    ) {
+        self.hits = hits
+        self.mode = mode
+        self.usedCharacterCount = usedCharacterCount
+        self.exhaustedBudget = exhaustedBudget
+    }
 
     public var records: [MemoryRecord] { hits.map(\.record) }
 }

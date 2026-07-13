@@ -16,7 +16,7 @@ final class SQLiteMemoryStoreTests: XCTestCase {
         let store = try makeStore(busyTimeout: 1_234)
         let diagnostics = try await store.diagnostics()
 
-        XCTAssertEqual(diagnostics.schemaVersion, 2)
+        XCTAssertEqual(diagnostics.schemaVersion, 5)
         XCTAssertEqual(diagnostics.journalMode.lowercased(), "wal")
         XCTAssertEqual(diagnostics.busyTimeoutMilliseconds, 1_234)
         XCTAssertTrue(diagnostics.fullTextSearchAvailable)

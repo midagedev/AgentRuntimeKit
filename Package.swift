@@ -13,6 +13,7 @@ let package = Package(
         .library(name: "AgentRuntimeCore", targets: ["AgentRuntimeCore"]),
         .library(name: "AgentRuntimeProviders", targets: ["AgentRuntimeProviders"]),
         .library(name: "AgentRuntimeMemory", targets: ["AgentRuntimeMemory"]),
+        .library(name: "AgentRuntimeFileMemory", targets: ["AgentRuntimeFileMemory"]),
         .library(name: "AgentRuntimeApple", targets: ["AgentRuntimeApple"]),
         .library(name: "AgentRuntimeMCP", targets: ["AgentRuntimeMCP"]),
         .library(name: "AgentRuntimeTestKit", targets: ["AgentRuntimeTestKit"]),
@@ -33,8 +34,17 @@ let package = Package(
             dependencies: ["AgentRuntimeCore", "CAgentSQLite"]
         ),
         .target(
-            name: "AgentRuntimeApple",
+            name: "AgentRuntimeFileMemory",
             dependencies: ["AgentRuntimeCore", "AgentRuntimeMemory"],
+            resources: [.process("Resources/PrivacyInfo.xcprivacy")]
+        ),
+        .target(
+            name: "AgentRuntimeApple",
+            dependencies: [
+                "AgentRuntimeCore",
+                "AgentRuntimeMemory",
+                "AgentRuntimeFileMemory",
+            ],
             resources: [.process("Resources/PrivacyInfo.xcprivacy")],
             linkerSettings: [.linkedFramework("Security")]
         ),
@@ -59,8 +69,21 @@ let package = Package(
             dependencies: ["AgentRuntimeMemory", "AgentRuntimeCore", "CAgentSQLite"]
         ),
         .testTarget(
+            name: "AgentRuntimeFileMemoryTests",
+            dependencies: [
+                "AgentRuntimeFileMemory",
+                "AgentRuntimeMemory",
+                "AgentRuntimeCore",
+            ]
+        ),
+        .testTarget(
             name: "AgentRuntimeAppleTests",
-            dependencies: ["AgentRuntimeApple", "AgentRuntimeCore", "AgentRuntimeMemory"]
+            dependencies: [
+                "AgentRuntimeApple",
+                "AgentRuntimeCore",
+                "AgentRuntimeMemory",
+                "AgentRuntimeFileMemory",
+            ]
         ),
         .testTarget(
             name: "AgentRuntimeMCPTests",

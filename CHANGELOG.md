@@ -5,6 +5,51 @@ All notable changes to AgentRuntimeKit are documented here. The project follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-13
+
+### Added
+
+- Added `AgentRuntimeFileMemory`, a bounded read-only Markdown/text directory
+  scanner with deterministic chunk identity, content hashes, and structured
+  scan diagnostics.
+- Added atomic source snapshot reconciliation with stable record mappings,
+  generation compare-and-swap, and archive-or-purge missing-record policies for
+  both in-memory and SQLite stores.
+- Added an Apple iCloud Drive file-memory adapter with an injectable container
+  locator, coordinated reads/writes/removals, current-version download checks,
+  explicit mutation preconditions, and no silent local fallback.
+- Added public construction surfaces for community-owned `MemoryStore`
+  implementations.
+
+### Changed
+
+- Source reconciliation now supports atomic deduplication-key changes, swaps,
+  and cycles while preserving stable mapped UUIDs.
+- Large source purges now remove mapped records, events, and deduplication state
+  in bounded batches instead of repeatedly scanning the full store.
+- SQLite privacy-purge cleanup is durably scheduled and skipped for later no-op
+  purges after a successful compaction.
+- Existing 0.1.x SQLite rows retain exact-byte lookup and erasure compatibility,
+  with an explicit inventory-and-purge path for non-canonical persisted scopes.
+
+### Security
+
+- Reject hidden entries, symbolic links, traversal paths, binary content,
+  invalid UTF-8, oversized inventories (including non-file entries), and
+  secret-sensitivity file indexes.
+- Bound chunk count, generated characters, and repeated Markdown heading context,
+  and split long paragraphs in linear time.
+- Added a dedicated file-memory privacy manifest and descriptor-rooted local
+  and iCloud path traversal that does not follow symbolic links.
+- Enforced backend-consistent scope/source identity validation and length-aware,
+  fail-closed SQLite text serialization.
+- Preserved byte-distinct Unicode filesystem path identities across equality,
+  hashing, ordering, and inventory deduplication.
+- Made validated iCloud configuration immutable and rechecked container identity
+  after a metadata query starts so account transitions fail closed.
+- Reject lossy NUL and present-empty legacy scope aliases in ordinary APIs while
+  keeping strict validation for every new memory and file-source write.
+
 ## [0.1.1] - 2026-07-13
 
 ### Fixed
@@ -32,6 +77,7 @@ All notable changes to AgentRuntimeKit are documented here. The project follows
 - Opt-in live Anthropic contracts for streaming, continuation, tools,
   cancellation, and sanitized authentication failures.
 
-[Unreleased]: https://github.com/midagedev/AgentRuntimeKit/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/midagedev/AgentRuntimeKit/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/midagedev/AgentRuntimeKit/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/midagedev/AgentRuntimeKit/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/midagedev/AgentRuntimeKit/releases/tag/v0.1.0

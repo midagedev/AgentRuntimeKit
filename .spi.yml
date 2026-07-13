@@ -3,6 +3,8 @@ builder:
   configs:
     - platform: macos-spm
       scheme: AgentRuntimeCore
+    - platform: macos-spm
+      scheme: AgentRuntimeFileMemory
     - platform: ios
       scheme: AgentRuntimeApple
     - platform: watchos

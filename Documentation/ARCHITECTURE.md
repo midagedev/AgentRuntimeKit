@@ -9,6 +9,7 @@ provider-neutral execution contract and leaves product behavior in the host app.
 Host application domain tools and context sources
                          │
        AgentRuntimeApple │ AgentRuntimeMCP
+                         │ AgentRuntimeFileMemory
                     └────┼────┘
                          ▼
  AgentRuntimeProviders  AgentRuntimeMemory
@@ -51,6 +52,7 @@ The package owns:
 - the bounded tool-call loop;
 - schema validation, permission decisions, approvals, and audit events;
 - scoped memory storage, retrieval, expiry, provenance, and privacy purge;
+- atomic source reconciliation and a read-only file-to-memory indexing layer;
 - Keychain and protected-file adapters;
 - optional remote MCP discovery and calls.
 
@@ -61,6 +63,22 @@ The host app owns:
 - consent for sensitive context;
 - UI, voice, avatar, notifications, and background behavior;
 - whether credentials are user-provided or resolved by a server proxy.
+
+## File-memory boundary
+
+File memory uses canonical user-owned Markdown or text files and a rebuildable
+`MemorySourceReconciliationStore` index. A scan is a complete source snapshot:
+stable source record IDs preserve memory UUIDs across edits, while a generation
+compare-and-swap prevents stale scans from replacing a newer inventory. Missing
+records are archived by default. A purge policy is available only for products
+whose deletion and backup semantics make physical removal appropriate.
+
+The scanner is read-only and bounded. It rejects symbolic links, traversal,
+hidden and non-regular entries, binary or invalid UTF-8 data, files that mutate
+during a scan, and inventories beyond configured depth, count, or byte limits.
+Filesystem notifications are hints to start another full scan, never a mutation
+log. iCloud Drive is an Apple adapter at the same file-access seam; selecting it
+never introduces an implicit local fallback.
 
 ## Memory deletion boundary
 
@@ -81,6 +99,14 @@ reader blocks either post-commit step, `MemoryPurgeCleanupError` carries the
 already-committed counts and the caller can safely retry the same purge. This
 boundary covers the live store artifacts, not platform backups or filesystem
 snapshots controlled outside the process.
+
+Databases created by 0.1.x may contain scope identifiers that 0.2 no longer
+accepts for new writes. SQLite ordinary reads and erasures retain exact-byte
+compatibility for safely preserved legacy identifiers, but never reproduce the
+old NUL-terminated binding or treat a present-empty optional as `nil`. Hosts can
+inspect non-canonical persisted namespaces with `legacyScopeInventory()` and
+purge an exact returned namespace with `purgeLegacyPersistedScope(_:)`. This
+administrative path is intentionally separate from ordinary scope selection.
 
 ## Compatibility
 

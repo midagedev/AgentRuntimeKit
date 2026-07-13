@@ -380,7 +380,7 @@ public typealias AppleProtectedCheckpointStore = ProtectedFileAgentCheckpointSto
 ///
 /// The wrapped SQLite store is deliberately not exposed: routing access through
 /// this actor keeps future sidecar creation inside the protection boundary.
-public actor ProtectedSQLiteMemoryStore: MemoryStore {
+public actor ProtectedSQLiteMemoryStore: MemoryStore, MemorySourceReconciliationStore {
     public struct Configuration: Sendable, Hashable {
         /// Keep this URL in the app, app-group, or CloudKit container. The
         /// package privacy manifest declares Apple's C617.1 container reason
@@ -526,6 +526,60 @@ public actor ProtectedSQLiteMemoryStore: MemoryStore {
             try protectArtifacts()
             return result
         } catch {
+            let operationError = error
+            try protectArtifacts()
+            throw operationError
+        }
+    }
+
+    public func legacyScopeInventory() async throws -> [SQLiteLegacyScopeSummary] {
+        let result = try await store.legacyScopeInventory()
+        try protectArtifacts()
+        return result
+    }
+
+    public func purgeLegacyPersistedScope(
+        _ persistedScope: MemoryScope
+    ) async throws -> MemoryPurgeResult {
+        do {
+            let result = try await store.purgeLegacyPersistedScope(persistedScope)
+            try protectArtifacts()
+            return result
+        } catch {
+            let operationError = error
+            try protectArtifacts()
+            throw operationError
+        }
+    }
+
+    public func sourceState(
+        identifier: String,
+        scope: MemoryScope
+    ) async throws -> MemorySourceState? {
+        let state = try await store.sourceState(identifier: identifier, scope: scope)
+        try protectArtifacts()
+        return state
+    }
+
+    public func reconcileSourceSnapshot(
+        _ snapshot: MemorySourceSnapshot,
+        expectedGeneration: Int,
+        missingPolicy: MemorySourceMissingPolicy,
+        at date: Date
+    ) async throws -> MemorySourceReconciliationReport {
+        do {
+            let report = try await store.reconcileSourceSnapshot(
+                snapshot,
+                expectedGeneration: expectedGeneration,
+                missingPolicy: missingPolicy,
+                at: date
+            )
+            try protectArtifacts()
+            return report
+        } catch {
+            // Reconciliation can commit before post-commit SQLite cleanup
+            // reports a failure. Reapply protection without obscuring the
+            // operation error, matching the physical-purge boundary above.
             let operationError = error
             try protectArtifacts()
             throw operationError

@@ -7,7 +7,8 @@ include a narrowly scoped source-compatible hardening change in a patch release.
 
 | Version | Supported |
 | --- | --- |
-| 0.1.x | Yes |
+| 0.2.x | Yes |
+| 0.1.x | No |
 | Earlier/unreleased snapshots | No |
 
 ## Reporting a vulnerability
@@ -73,6 +74,29 @@ a fix and disclosure window, and credit reporters who request attribution.
   explicit policy approval unless it is short-lived session data.
 - Records carry provenance, revision, confidence, importance, and optional TTL.
   Expired records are not returned as active context.
+- File-memory scans accept only validated root-relative paths and bounded UTF-8
+  Markdown/text inputs. Hidden entries, symbolic links, traversal, non-regular
+  files, binary data, and files that mutate during a scan are rejected rather
+  than partially reconciled.
+- Chunk count, generated characters, and bounded Markdown heading context limit
+  output amplification independently of source byte limits.
+- Source snapshots commit records, mappings, missing-record handling, and the
+  next generation atomically. An unavailable local or iCloud source must not be
+  represented as an empty snapshot, because that would incorrectly archive or
+  purge the prior index.
+- Scope, source, and source-record identities reject controls, ambiguous empty
+  optionals, surrounding whitespace, and non-NFC Unicode so in-memory and SQLite
+  backends preserve the same exact isolation boundary.
+- SQLite keeps exact-byte read, update, and erasure compatibility for 0.1.x
+  scopes containing whitespace, non-NFC text, or non-NUL controls, while all new
+  writes remain strict. Standard APIs reject NUL and present-empty aliases.
+  Irrecoverably truncated or empty legacy storage keys are available only through
+  `legacyScopeInventory()` and the explicit `purgeLegacyPersistedScope(_:)`
+  administrative erasure path; that path never reinterprets a discarded suffix.
+- The iCloud Drive adapter requires one explicit entitled container, coordinates
+  file access, waits for requested downloads, and fails on unresolved versions.
+  It never falls back to a local directory. Hosts remain responsible for storage
+  consent, conflict UI, iCloud retention, and account-change handling.
 - Apple hosts handling sensitive data should use `ProtectedSQLiteMemoryStore`,
   which reapplies permissions and Data Protection attributes to the database,
   WAL, and SHM files. iOS-family platforms apply the selected Data Protection
@@ -87,9 +111,12 @@ a fix and disclosure window, and credit reporters who request attribution.
   the WAL. `MemoryPurgeCleanupError` explicitly distinguishes a committed logical
   purge from an incomplete post-commit cleanup. Hosts remain responsible for
   retention and erasure policies of backups or filesystem snapshots.
-- `AgentRuntimeApple` declares file-metadata reason C617.1. Protected store URLs
-  used in distributed apps must remain inside the app, app-group, or CloudKit
+- `AgentRuntimeApple` declares file-metadata reason C617.1. Protected store and
+  explicit iCloud-container URLs used in distributed apps must remain inside a
   container covered by that reason.
+- `AgentRuntimeFileMemory` ships its own privacy manifest and declares C617.1
+  for app/container roots plus 3B52.1 for roots the person explicitly grants to
+  the host. Products must not pass arbitrary ungranted filesystem locations.
 
 ## Checkpoints and audit
 

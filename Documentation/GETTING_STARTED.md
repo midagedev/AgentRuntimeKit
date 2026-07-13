@@ -11,9 +11,12 @@ In Xcode, add:
 https://github.com/midagedev/AgentRuntimeKit.git
 ```
 
-Use a semantic version requirement starting at `0.1.1`. Select
+Use a semantic version requirement starting at `0.2.0`. Select
 `AgentRuntimeCore` and the provider, memory, Apple, or MCP products required by
 your app.
+
+For canonical Markdown or text memory, also select
+`AgentRuntimeFileMemory` and read [File-based Memory](FILE_MEMORY.md).
 
 ## Build the host boundary
 

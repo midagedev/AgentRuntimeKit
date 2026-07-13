@@ -1,4 +1,5 @@
 import AgentRuntimeMemory
+import CAgentSQLite
 import XCTest
 
 final class MemoryStoreHardeningTests: XCTestCase {
@@ -68,6 +69,55 @@ final class MemoryStoreHardeningTests: XCTestCase {
         )
     }
 
+    func testInMemoryRejectsControlCharactersInScopeIdentity() async throws {
+        await assertControlCharacterScopeRejected(store: InMemoryMemoryStore())
+    }
+
+    func testSQLiteRejectsControlCharactersInScopeIdentity() async throws {
+        let temporary = try TemporaryMemoryDirectory()
+        let store = try SQLiteMemoryStore(url: temporary.url.appendingPathComponent("memory.sqlite"))
+        await assertControlCharacterScopeRejected(store: store)
+    }
+
+    func testSQLiteTextBindingPreservesEmbeddedNULInContent() async throws {
+        let temporary = try TemporaryMemoryDirectory()
+        let store = try SQLiteMemoryStore(url: temporary.url.appendingPathComponent("memory.sqlite"))
+        let scope = MemoryScope.user(appID: "app", userID: "user")
+        let content = "prefix\0suffix"
+
+        let stored = try await store.upsert(proposal(scope: scope, content: content))
+        let fetched = try await store.fetch(id: stored.id, scope: scope, includeExpired: true)
+
+        XCTAssertEqual(fetched?.content, content)
+    }
+
+    func testSQLiteMalformedUTF8TextFailsClosed() async throws {
+        let temporary = try TemporaryMemoryDirectory()
+        let url = temporary.url.appendingPathComponent("memory.sqlite")
+        let scope = MemoryScope.user(appID: "app", userID: "user")
+        let store = try SQLiteMemoryStore(url: url)
+        let stored = try await store.upsert(proposal(scope: scope, content: "valid"))
+        try await store.close()
+
+        var database: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+        let opened = try XCTUnwrap(database)
+        defer { sqlite3_close_v2(opened) }
+        let sql = "UPDATE memory_records SET content = CAST(X'80' AS TEXT) "
+            + "WHERE id = '\(stored.id.uuidString)'"
+        XCTAssertEqual(sqlite3_exec(opened, sql, nil, nil, nil), SQLITE_OK)
+
+        let reopened = try SQLiteMemoryStore(url: url)
+        do {
+            _ = try await reopened.fetch(id: stored.id, scope: scope, includeExpired: true)
+            XCTFail("Malformed UTF-8 must not be replacement-decoded into a memory record")
+        } catch let error as MemoryStoreError {
+            guard case .serialization = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+    }
+
     private func assertEffectiveTTLParticipatesInEquality(store: any MemoryStore) async throws {
         let scope = MemoryScope.session(appID: "app", sessionID: "session")
         let start = Date(timeIntervalSince1970: 4_000_000)
@@ -95,6 +145,27 @@ final class MemoryStoreHardeningTests: XCTestCase {
         )
         XCTAssertEqual(expiryRemoved.revision, 3)
         XCTAssertNil(expiryRemoved.expiresAt)
+    }
+
+    private func assertControlCharacterScopeRejected(store: any MemoryStore) async {
+        let invalidScopes: [MemoryScope] = [
+            .user(appID: "app", userID: "user\0other"),
+            MemoryScope(level: .application, appID: "app", userID: ""),
+            .user(appID: "app", userID: " user "),
+            .user(appID: "app", userID: "e\u{301}"),
+        ]
+        for scope in invalidScopes {
+            do {
+                _ = try await store.upsert(proposal(scope: scope, content: "must fail"))
+                XCTFail("Non-canonical scope identity must fail before storage")
+            } catch let error as MemoryStoreError {
+                guard case .invalidScope = error else {
+                    return XCTFail("Unexpected error: \(error)")
+                }
+            } catch {
+                XCTFail("Unexpected error: \(error)")
+            }
+        }
     }
 
     private func assertContentPatchIdentitySafety(store: any MemoryStore) async throws {
